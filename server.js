@@ -135,14 +135,14 @@ async function getAccessToken() {
 // Esta función hace exactamente lo mismo que cuando llega una notificación
 // real de Mercado Libre, pero la podemos disparar nosotros mismos con una
 // pregunta que ya existe, sin necesidad de crear preguntas nuevas.
-async function procesarPregunta(resource) {
+async function procesarPregunta(resource, { ignorarEstado = false } = {}) {
   const token = await getAccessToken();
 
   const { data: question } = await axios.get(`https://api.mercadolibre.com${resource}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
 
-  if (question.status !== 'UNANSWERED') {
+  if (question.status !== 'UNANSWERED' && !ignorarEstado) {
     return { ok: false, motivo: `La pregunta ya tiene estado "${question.status}", no está pendiente de responder.` };
   }
 
@@ -176,7 +176,7 @@ app.get('/debug/simulate-question', async (req, res) => {
   const { id } = req.query;
   if (!id) return res.status(400).send('Falta el parámetro id. Ejemplo: /debug/simulate-question?id=5036111111');
   try {
-    const resultado = await procesarPregunta(`/questions/${id}`);
+    const resultado = await procesarPregunta(`/questions/${id}`, { ignorarEstado: true });
     res.json(resultado);
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
