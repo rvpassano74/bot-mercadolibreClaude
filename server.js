@@ -89,7 +89,8 @@ app.get('/oauth/callback', async (req, res) => {
     data.access_token = response.data.access_token;
     data.refresh_token = response.data.refresh_token;
     data.expires_at = Date.now() + response.data.expires_in * 1000;
-    saveData(data);
+    await saveData(data);
+    console.log('Cuenta conectada y guardada en Upstash. refresh_token presente:', !!data.refresh_token);
     res.send('✅ ¡Listo! Tu cuenta de Mercado Libre quedó conectada. Ya podés cerrar esta pestaña.');
   } catch (err) {
     console.error(err.response?.data || err.message);
@@ -204,6 +205,39 @@ app.post('/telegram/webhook', async (req, res) => {
       chat_id: TELEGRAM_CHAT_ID,
       text: '❌ Hubo un error al enviar la respuesta a Mercado Libre. Probá de nuevo en un momento.',
     });
+  }
+});
+
+// =====================================================================
+// HERRAMIENTA DE DIAGNÓSTICO: ver qué avisos mandó Mercado Libre de
+// verdad (sirve para descubrir si el problema es de configuración de
+// ML o de nuestro servidor).
+// =====================================================================
+
+app.get('/debug/state', async (req, res) => {
+  const fresh = await loadData();
+  res.json({
+    en_memoria_del_servidor: {
+      tiene_refresh_token: !!data.refresh_token,
+      expira_en_minutos: Math.round((data.expires_at - Date.now()) / 60000),
+    },
+    guardado_en_upstash: {
+      tiene_refresh_token: !!fresh.refresh_token,
+      expira_en_minutos: Math.round((fresh.expires_at - Date.now()) / 60000),
+    },
+  });
+});
+
+app.get('/debug/feeds', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+    const response = await axios.get('https://api.mercadolibre.com/myfeeds', {
+      params: { app_id: ML_CLIENT_ID },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    res.json(response.data);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
   }
 });
 
