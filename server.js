@@ -64,7 +64,7 @@ app.get('/', (req, res) => {
   if (!ML_CLIENT_ID || !ML_REDIRECT_URI) {
     return res.send('Faltan variables de entorno ML_CLIENT_ID / ML_REDIRECT_URI. Revisá la configuración.');
   }
-  const authUrl = `https://auth.mercadolibre.com.ar/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(ML_REDIRECT_URI)}`;
+  const authUrl = `https://auth.mercadolibre.com.ar/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(ML_REDIRECT_URI)}&scope=${encodeURIComponent('offline_access read write')}`;
   res.send(`
     <h2>Bot Mercado Libre + Telegram</h2>
     <p>Estado de la conexión con Mercado Libre: <b>${data.refresh_token ? 'Conectado ✅' : 'No conectado ❌'}</b></p>
@@ -86,6 +86,12 @@ app.get('/oauth/callback', async (req, res) => {
         redirect_uri: ML_REDIRECT_URI,
       },
     });
+    if (!response.data.refresh_token) {
+      console.error('Mercado Libre no devolvió refresh_token. Respuesta completa:', response.data);
+      return res.status(500).send(
+        '⚠️ Mercado Libre no envió el "refresh_token" (revisá el scope en la URL de autorización, tiene que incluir offline_access). Volvé a la URL principal e intentá conectar de nuevo.'
+      );
+    }
     data.access_token = response.data.access_token;
     data.refresh_token = response.data.refresh_token;
     data.expires_at = Date.now() + response.data.expires_in * 1000;
@@ -228,10 +234,15 @@ app.get('/debug/state', async (req, res) => {
   });
 });
 
+// Esto muestra los avisos que Mercado Libre intentó mandar pero nunca
+// recibieron una respuesta 200 de nuestro servidor (avisos "perdidos").
+// Si aparece vacío, puede ser buena señal (nada se perdió) o puede ser
+// que Mercado Libre directamente no esté mandando nada; para saber
+// cuál de las dos es, hay que mirarlo en conjunto con los Logs de Render.
 app.get('/debug/feeds', async (req, res) => {
   try {
     const token = await getAccessToken();
-    const response = await axios.get('https://api.mercadolibre.com/myfeeds', {
+    const response = await axios.get('https://api.mercadolibre.com/missed_feeds', {
       params: { app_id: ML_CLIENT_ID },
       headers: { Authorization: `Bearer ${token}` },
     });
