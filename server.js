@@ -59,7 +59,7 @@ async function saveData(d) {
 // Se carga una vez al arrancar el servidor. A partir de ahí, cada vez
 // que algo cambia (se conecta la cuenta, llega una pregunta, se
 // renueva el token) se actualiza acá Y se guarda en Upstash.
-let data = { access_token: null, refresh_token: null, expires_at: 0, pending: {} };
+let data = { access_token: null, refresh_token: null, expires_at: 0, pending: {}, notificadas: [] };
 
 // =====================================================================
 // PASO A: Conectar tu cuenta de Mercado Libre (solo se hace una vez)
@@ -304,9 +304,50 @@ app.get('/debug/feeds', async (req, res) => {
   }
 });
 
+// =====================================================================
+// PLAN B: en vez de esperar el aviso (webhook) de Mercado Libre, el
+// bot pregunta activamente cada 1 minuto si hay preguntas nuevas sin
+// responder. Es un poco menos instantáneo, pero no depende de que
+// Mercado Libre nos avise (que es justo lo que estaba fallando).
+// =====================================================================
+
+async function revisarPreguntasNuevas() {
+  if (!data.refresh_token) return; // Todavía no conectaste la cuenta
+
+  try {
+    const token = await getAccessToken();
+    const response = await axios.get('https://api.mercadolibre.com/my/received_questions/search', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const preguntas = response.data.questions || [];
+    if (!Array.isArray(data.notificadas)) data.notificadas = [];
+
+    const nuevas = preguntas.filter(
+      (q) => q.status === 'UNANSWERED' && !data.notificadas.includes(q.id)
+    );
+
+    for (const q of nuevas) {
+      const resultado = await procesarPregunta(`/questions/${q.id}`, { ignorarEstado: true });
+      if (resultado.ok) {
+        data.notificadas.push(q.id);
+      }
+    }
+
+    if (nuevas.length > 0) {
+      await saveData(data);
+      console.log(`🔎 Sondeo: se avisaron ${nuevas.length} pregunta(s) nueva(s).`);
+    }
+  } catch (err) {
+    console.error('Error revisando preguntas nuevas:', err.response?.data || err.message);
+  }
+}
+
 async function start() {
   data = await loadData();
   app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
+  setInterval(revisarPreguntasNuevas, 60 * 1000); // cada 1 minuto
+  revisarPreguntasNuevas(); // y una vez apenas arranca
 }
 
 start();
