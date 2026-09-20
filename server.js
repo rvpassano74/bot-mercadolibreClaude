@@ -59,7 +59,16 @@ async function saveData(d) {
 // Se carga una vez al arrancar el servidor. A partir de ahí, cada vez
 // que algo cambia (se conecta la cuenta, llega una pregunta, se
 // renueva el token) se actualiza acá Y se guarda en Upstash.
-let data = { access_token: null, refresh_token: null, expires_at: 0, pending: {}, notificadas: [] };
+let data = {
+  access_token: null,
+  refresh_token: null,
+  expires_at: 0,
+  pending: {},
+  notificadas: [], // preguntas ya avisadas
+  ventas_notificadas: [], // ventas ya avisadas
+  ventas_inicializado: false, // si ya hicimos el primer barrido silencioso
+  user_id: null, // tu ID de vendedor en Mercado Libre (se completa solo)
+};
 
 // =====================================================================
 // PASO A: Conectar tu cuenta de Mercado Libre (solo se hace una vez)
@@ -291,6 +300,57 @@ app.get('/debug/state', async (req, res) => {
 // Si aparece vacío, puede ser buena señal (nada se perdió) o puede ser
 // que Mercado Libre directamente no esté mandando nada; para saber
 // cuál de las dos es, hay que mirarlo en conjunto con los Logs de Render.
+// Muestra tus ventas recientes con su ID, para poder probar el aviso
+// sin tener que esperar una venta nueva de verdad.
+app.get('/debug/list-orders', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+    const userId = await obtenerUserId(token);
+    const response = await axios.get('https://api.mercadolibre.com/orders/search', {
+      params: { seller: userId, 'order.status': 'paid', sort: 'date_desc', limit: 10 },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const ordenes = (response.data.results || []).map((o) => ({
+      id: o.id,
+      comprador: o.buyer?.nickname,
+      total: o.total_amount,
+      fecha: o.date_created,
+    }));
+    res.json(ordenes);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Manda a Telegram el aviso de una venta ya existente, para probar el
+// formato del mensaje sin esperar una venta real. Ejemplo:
+// /debug/simulate-order?id=2000018126310134
+app.get('/debug/simulate-order', async (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.status(400).send('Falta el parámetro id. Ejemplo: /debug/simulate-order?id=2000018126310134');
+  try {
+    const token = await getAccessToken();
+    const { data: orden } = await axios.get(`https://api.mercadolibre.com/orders/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const productos = (orden.order_items || [])
+      .map((it) => `• ${it.quantity} x ${it.item.title}`)
+      .join('\n');
+    const comprador = orden.buyer?.nickname || 'Comprador';
+    const total = formatearMoneda(orden.total_amount, orden.currency_id);
+    const texto =
+      `💰 ¡Nueva venta! (prueba)\n\n` +
+      `🧾 Orden: ${orden.id}\n` +
+      `👤 Comprador: ${comprador}\n` +
+      `📦 Producto(s):\n${productos}\n\n` +
+      `💵 Total: ${total}`;
+    await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: texto });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 app.get('/debug/feeds', async (req, res) => {
   try {
     const token = await getAccessToken();
@@ -343,11 +403,89 @@ async function revisarPreguntasNuevas() {
   }
 }
 
+// Consigue tu ID de vendedor una sola vez y lo guarda, para no tener
+// que pedirlo en cada revisión.
+async function obtenerUserId(token) {
+  if (data.user_id) return data.user_id;
+  const { data: user } = await axios.get('https://api.mercadolibre.com/users/me', {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  data.user_id = user.id;
+  await saveData(data);
+  return data.user_id;
+}
+
+function formatearMoneda(monto, moneda) {
+  return `${moneda === 'ARS' ? '$' : moneda + ' '}${Number(monto).toLocaleString('es-AR')}`;
+}
+
+async function revisarVentasNuevas() {
+  if (!data.refresh_token) return;
+
+  try {
+    const token = await getAccessToken();
+    const userId = await obtenerUserId(token);
+
+    const response = await axios.get('https://api.mercadolibre.com/orders/search', {
+      params: { seller: userId, 'order.status': 'paid', sort: 'date_desc', limit: 20 },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const ordenes = response.data.results || [];
+    if (!Array.isArray(data.ventas_notificadas)) data.ventas_notificadas = [];
+
+    // La primera vez que arranca el bot, solo "toma nota" de las ventas
+    // que ya existen (sin avisar nada), para no mandarte de golpe todo
+    // el historial como si fueran ventas nuevas.
+    if (!data.ventas_inicializado) {
+      data.ventas_notificadas = ordenes.map((o) => o.id);
+      data.ventas_inicializado = true;
+      await saveData(data);
+      console.log(`💰 Primer barrido: se registraron ${ordenes.length} venta(s) existentes sin avisar.`);
+      return;
+    }
+
+    // Revisamos de la más vieja a la más nueva, para que si hay varias
+    // lleguen a Telegram en orden cronológico.
+    const nuevas = ordenes.filter((o) => !data.ventas_notificadas.includes(o.id)).reverse();
+
+    for (const orden of nuevas) {
+      const productos = (orden.order_items || [])
+        .map((it) => `• ${it.quantity} x ${it.item.title}`)
+        .join('\n');
+      const comprador = orden.buyer?.nickname || 'Comprador';
+      const total = formatearMoneda(orden.total_amount, orden.currency_id);
+
+      const texto =
+        `💰 ¡Nueva venta!\n\n` +
+        `🧾 Orden: ${orden.id}\n` +
+        `👤 Comprador: ${comprador}\n` +
+        `📦 Producto(s):\n${productos}\n\n` +
+        `💵 Total: ${total}`;
+
+      await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: texto });
+      data.ventas_notificadas.push(orden.id);
+    }
+
+    if (nuevas.length > 0) {
+      await saveData(data);
+      console.log(`💰 Sondeo: se avisaron ${nuevas.length} venta(s) nueva(s).`);
+    }
+  } catch (err) {
+    console.error('Error revisando ventas nuevas:', err.response?.data || err.message);
+  }
+}
+
+async function revisarTodo() {
+  await revisarPreguntasNuevas();
+  await revisarVentasNuevas();
+}
+
 async function start() {
   data = await loadData();
   app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
-  setInterval(revisarPreguntasNuevas, 60 * 1000); // cada 1 minuto
-  revisarPreguntasNuevas(); // y una vez apenas arranca
+  setInterval(revisarTodo, 60 * 1000); // cada 1 minuto
+  revisarTodo(); // y una vez apenas arranca
 }
 
 start();
