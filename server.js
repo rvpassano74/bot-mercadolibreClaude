@@ -67,8 +67,13 @@ let data = {
   notificadas: [], // preguntas ya avisadas
   ventas_notificadas: [], // ventas ya avisadas
   ventas_inicializado: false, // si ya hicimos el primer barrido silencioso
+  reclamos_notificados: [], // reclamos ya avisados
+  reclamos_inicializado: false,
+  stock_alertado: {}, // qué publicaciones ya están en alerta de stock bajo
   user_id: null, // tu ID de vendedor en Mercado Libre (se completa solo)
 };
+
+const STOCK_MINIMO = 2; // avisar cuando quedan esta cantidad o menos
 
 // =====================================================================
 // PASO A: Conectar tu cuenta de Mercado Libre (solo se hace una vez)
@@ -351,6 +356,60 @@ app.get('/debug/simulate-order', async (req, res) => {
   }
 });
 
+// Muestra tus reclamos tal cual los ve el bot.
+app.get('/debug/list-claims', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+    const response = await axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
+      params: { sort: 'date_created:desc' },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const reclamos = (response.data.data || []).map((r) => ({
+      id: r.id,
+      tipo: r.type,
+      estado: r.status,
+      etapa: r.stage,
+      orden: r.resource_id,
+    }));
+    res.json(reclamos);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Muestra el stock actual de tus publicaciones activas y si están en
+// alerta, tal cual lo ve el bot.
+app.get('/debug/list-stock', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+    const userId = await obtenerUserId(token);
+    const { data: idsResponse } = await axios.get(
+      `https://api.mercadolibre.com/users/${userId}/items/search`,
+      { params: { status: 'active', limit: 100 }, headers: { Authorization: `Bearer ${token}` } }
+    );
+    const itemIds = idsResponse.results || [];
+    const resultado = [];
+    for (const grupo of partirEnGrupos(itemIds, 20)) {
+      const { data: items } = await axios.get('https://api.mercadolibre.com/items', {
+        params: { ids: grupo.join(','), attributes: 'id,title,available_quantity' },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      for (const { body: item } of items) {
+        if (!item) continue;
+        resultado.push({
+          id: item.id,
+          titulo: item.title,
+          stock: item.available_quantity,
+          en_alerta: !!(data.stock_alertado && data.stock_alertado[item.id]),
+        });
+      }
+    }
+    res.json(resultado);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 app.get('/debug/feeds', async (req, res) => {
   try {
     const token = await getAccessToken();
@@ -476,9 +535,131 @@ async function revisarVentasNuevas() {
   }
 }
 
+// =====================================================================
+// Reclamos: mismo método (revisar cada 1 minuto), sin depender de
+// ningún tópico tildado en la app de Mercado Libre.
+// =====================================================================
+
+async function revisarReclamosNuevos() {
+  if (!data.refresh_token) return;
+
+  try {
+    const token = await getAccessToken();
+    const response = await axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
+      params: { sort: 'date_created:desc' },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const reclamos = response.data.data || [];
+    if (!Array.isArray(data.reclamos_notificados)) data.reclamos_notificados = [];
+
+    // Primera vez: solo registramos los que ya existen, sin avisar.
+    if (!data.reclamos_inicializado) {
+      data.reclamos_notificados = reclamos.map((r) => r.id);
+      data.reclamos_inicializado = true;
+      await saveData(data);
+      console.log(`⚠️ Primer barrido: se registraron ${reclamos.length} reclamo(s) existentes sin avisar.`);
+      return;
+    }
+
+    const nuevos = reclamos.filter((r) => !data.reclamos_notificados.includes(r.id)).reverse();
+
+    for (const reclamo of nuevos) {
+      const texto =
+        `⚠️ Nuevo reclamo\n\n` +
+        `🆔 Reclamo: ${reclamo.id}\n` +
+        `📄 Tipo: ${reclamo.type}\n` +
+        `🧾 Orden relacionada: ${reclamo.resource_id}\n` +
+        `📌 Estado: ${reclamo.status}${reclamo.stage ? ' (' + reclamo.stage + ')' : ''}\n\n` +
+        `Entrá a Mercado Libre > Reclamos para ver el detalle y responder.`;
+
+      await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: texto });
+      data.reclamos_notificados.push(reclamo.id);
+    }
+
+    if (nuevos.length > 0) {
+      await saveData(data);
+      console.log(`⚠️ Sondeo: se avisaron ${nuevos.length} reclamo(s) nuevo(s).`);
+    }
+  } catch (err) {
+    console.error('Error revisando reclamos nuevos:', err.response?.data || err.message);
+  }
+}
+
+// =====================================================================
+// Stock bajo: avisa cuando a una publicación le quedan pocas unidades.
+// Se avisa UNA vez cuando cae al mínimo, y se puede volver a avisar
+// más adelante si primero se repone stock y vuelve a bajar.
+// =====================================================================
+
+function partirEnGrupos(lista, tamano) {
+  const grupos = [];
+  for (let i = 0; i < lista.length; i += tamano) {
+    grupos.push(lista.slice(i, i + tamano));
+  }
+  return grupos;
+}
+
+async function revisarStockBajo() {
+  if (!data.refresh_token) return;
+
+  try {
+    const token = await getAccessToken();
+    const userId = await obtenerUserId(token);
+
+    // Traemos todas tus publicaciones activas (hasta 100; si tenés más,
+    // se pueden pedir de a páginas, pero para empezar alcanza con esto).
+    const { data: idsResponse } = await axios.get(
+      `https://api.mercadolibre.com/users/${userId}/items/search`,
+      { params: { status: 'active', limit: 100 }, headers: { Authorization: `Bearer ${token}` } }
+    );
+    const itemIds = idsResponse.results || [];
+    if (!data.stock_alertado || typeof data.stock_alertado !== 'object') data.stock_alertado = {};
+
+    let huboAlerta = false;
+
+    for (const grupo of partirEnGrupos(itemIds, 20)) {
+      const { data: items } = await axios.get('https://api.mercadolibre.com/items', {
+        params: { ids: grupo.join(','), attributes: 'id,title,available_quantity' },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      for (const { body: item } of items) {
+        if (!item) continue;
+        const yaAlertado = !!data.stock_alertado[item.id];
+
+        if (item.available_quantity <= STOCK_MINIMO && !yaAlertado) {
+          const texto =
+            `📦 Stock bajo\n\n` +
+            `🛒 Producto: ${item.title}\n` +
+            `🔢 Quedan: ${item.available_quantity} unidad(es)\n\n` +
+            `Considerá reponer stock pronto.`;
+          await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: texto });
+          data.stock_alertado[item.id] = true;
+          huboAlerta = true;
+        } else if (item.available_quantity > STOCK_MINIMO && yaAlertado) {
+          // Se repuso stock: reseteamos, para poder avisar de nuevo si
+          // en el futuro vuelve a bajar.
+          data.stock_alertado[item.id] = false;
+          huboAlerta = true;
+        }
+      }
+    }
+
+    if (huboAlerta) {
+      await saveData(data);
+      console.log('📦 Sondeo de stock: se actualizaron alertas.');
+    }
+  } catch (err) {
+    console.error('Error revisando stock bajo:', err.response?.data || err.message);
+  }
+}
+
 async function revisarTodo() {
   await revisarPreguntasNuevas();
   await revisarVentasNuevas();
+  await revisarReclamosNuevos();
+  await revisarStockBajo();
 }
 
 async function start() {
