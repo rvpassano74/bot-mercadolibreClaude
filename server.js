@@ -1,26 +1,9 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 app.use(express.json());
-
-const DATA_FILE = path.join(__dirname, 'data.json');
-
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) {
-    return { access_token: null, refresh_token: null, expires_at: 0, pending: {} };
-  }
-  return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-}
-
-function saveData(d) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2));
-}
-
-let data = loadData();
 
 const {
   ML_CLIENT_ID,
@@ -28,10 +11,48 @@ const {
   ML_REDIRECT_URI,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
+  UPSTASH_REDIS_REST_URL,
+  UPSTASH_REDIS_REST_TOKEN,
   PORT = 3000,
 } = process.env;
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+
+// ---------------------------------------------------------------------
+// "Memoria" del bot: en vez de guardar un archivo en el servidor (que
+// se borra cada vez que Render lo reinicia), la guardamos en una base
+// de datos gratuita externa (Upstash). Así el bot nunca "se olvida"
+// de que ya conectaste tu cuenta.
+// ---------------------------------------------------------------------
+
+const upstashHeaders = { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` };
+
+async function loadData() {
+  const empty = { access_token: null, refresh_token: null, expires_at: 0, pending: {} };
+  try {
+    const res = await axios.get(`${UPSTASH_REDIS_REST_URL}/get/botdata`, { headers: upstashHeaders });
+    if (!res.data.result) return empty;
+    return JSON.parse(res.data.result);
+  } catch (err) {
+    console.error('Error leyendo memoria del bot:', err.response?.data || err.message);
+    return empty;
+  }
+}
+
+async function saveData(d) {
+  try {
+    await axios.post(`${UPSTASH_REDIS_REST_URL}/set/botdata`, JSON.stringify(d), {
+      headers: { ...upstashHeaders, 'Content-Type': 'text/plain' },
+    });
+  } catch (err) {
+    console.error('Error guardando memoria del bot:', err.response?.data || err.message);
+  }
+}
+
+// Se carga una vez al arrancar el servidor. A partir de ahí, cada vez
+// que algo cambia (se conecta la cuenta, llega una pregunta, se
+// renueva el token) se actualiza acá Y se guarda en Upstash.
+let data = { access_token: null, refresh_token: null, expires_at: 0, pending: {} };
 
 // =====================================================================
 // PASO A: Conectar tu cuenta de Mercado Libre (solo se hace una vez)
@@ -186,4 +207,9 @@ app.post('/telegram/webhook', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
+async function start() {
+  data = await loadData();
+  app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
+}
+
+start();
