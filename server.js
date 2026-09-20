@@ -168,6 +168,25 @@ async function procesarPregunta(resource, { ignorarEstado = false } = {}) {
   return { ok: true };
 }
 
+// Ruta de PRUEBA: te muestra tus últimas preguntas con su ID, para que
+// no tengas que andar buscándolo a mano en Mercado Libre.
+app.get('/debug/list-questions', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+    const response = await axios.get('https://api.mercadolibre.com/my/received_questions/search', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const preguntas = (response.data.questions || []).map((q) => ({
+      id: q.id,
+      estado: q.status,
+      texto: q.text,
+    }));
+    res.json(preguntas);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 // Ruta de PRUEBA: entrando a esta URL desde el navegador (con el ID de
 // una pregunta que ya existe) probamos todo el proceso sin crear nada
 // nuevo en Mercado Libre. Ejemplo:
