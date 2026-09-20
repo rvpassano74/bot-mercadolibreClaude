@@ -132,6 +132,57 @@ async function getAccessToken() {
 // PASO B: Recibir avisos de Mercado Libre cuando llega una pregunta
 // =====================================================================
 
+// Esta función hace exactamente lo mismo que cuando llega una notificación
+// real de Mercado Libre, pero la podemos disparar nosotros mismos con una
+// pregunta que ya existe, sin necesidad de crear preguntas nuevas.
+async function procesarPregunta(resource) {
+  const token = await getAccessToken();
+
+  const { data: question } = await axios.get(`https://api.mercadolibre.com${resource}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (question.status !== 'UNANSWERED') {
+    return { ok: false, motivo: `La pregunta ya tiene estado "${question.status}", no está pendiente de responder.` };
+  }
+
+  const { data: item } = await axios.get(`https://api.mercadolibre.com/items/${question.item_id}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  const texto =
+    `❓ Nueva pregunta\n\n` +
+    `🛒 Producto: ${item.title}\n\n` +
+    `💬 Pregunta: ${question.text}\n\n` +
+    `Respondé este mensaje (con "Responder" / "Reply") con el texto que querés enviar al comprador.`;
+
+  const tgResponse = await axios.post(`${TELEGRAM_API}/sendMessage`, {
+    chat_id: TELEGRAM_CHAT_ID,
+    text: texto,
+  });
+
+  const sentMessageId = tgResponse.data.result.message_id;
+  data.pending[sentMessageId] = question.id;
+  await saveData(data);
+
+  return { ok: true };
+}
+
+// Ruta de PRUEBA: entrando a esta URL desde el navegador (con el ID de
+// una pregunta que ya existe) probamos todo el proceso sin crear nada
+// nuevo en Mercado Libre. Ejemplo:
+// /debug/simulate-question?id=5036111111
+app.get('/debug/simulate-question', async (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.status(400).send('Falta el parámetro id. Ejemplo: /debug/simulate-question?id=5036111111');
+  try {
+    const resultado = await procesarPregunta(`/questions/${id}`);
+    res.json(resultado);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 app.post('/ml/notifications', async (req, res) => {
   // Mercado Libre exige una respuesta rápida (200 OK), así que contestamos
   // de inmediato y procesamos el resto por atrás.
@@ -141,34 +192,7 @@ app.post('/ml/notifications', async (req, res) => {
   if (topic !== 'questions') return; // Por ahora solo manejamos preguntas
 
   try {
-    const token = await getAccessToken();
-
-    const { data: question } = await axios.get(`https://api.mercadolibre.com${resource}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    if (question.status !== 'UNANSWERED') return; // Ya fue respondida (por ej. desde la app de ML)
-
-    const { data: item } = await axios.get(`https://api.mercadolibre.com/items/${question.item_id}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    const texto =
-      `❓ Nueva pregunta\n\n` +
-      `🛒 Producto: ${item.title}\n\n` +
-      `💬 Pregunta: ${question.text}\n\n` +
-      `Respondé este mensaje (con "Responder" / "Reply") con el texto que querés enviar al comprador.`;
-
-    const tgResponse = await axios.post(`${TELEGRAM_API}/sendMessage`, {
-      chat_id: TELEGRAM_CHAT_ID,
-      text: texto,
-    });
-
-    // Guardamos a qué pregunta corresponde este mensaje de Telegram,
-    // para saber qué hacer cuando el vendedor responda.
-    const sentMessageId = tgResponse.data.result.message_id;
-    data.pending[sentMessageId] = question.id;
-    saveData(data);
+    await procesarPregunta(resource);
   } catch (err) {
     console.error('Error procesando pregunta:', err.response?.data || err.message);
   }
