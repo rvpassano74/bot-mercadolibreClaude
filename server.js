@@ -5,6 +5,13 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
+// Log temporal de diagnóstico: anota en los Logs de Render CUALQUIER
+// pedido que llegue al servidor, venga de donde venga.
+app.use((req, res, next) => {
+  console.log(`➡️  ${req.method} ${req.path}`);
+  next();
+});
+
 const {
   ML_CLIENT_ID,
   ML_CLIENT_SECRET,
@@ -206,6 +213,8 @@ app.post('/ml/notifications', async (req, res) => {
   // Mercado Libre exige una respuesta rápida (200 OK), así que contestamos
   // de inmediato y procesamos el resto por atrás.
   res.sendStatus(200);
+
+  console.log('📩 Notificación recibida de Mercado Libre:', JSON.stringify(req.body));
 
   const { topic, resource } = req.body || {};
   if (topic !== 'questions') return; // Por ahora solo manejamos preguntas
