@@ -60,11 +60,42 @@ function datosVacios() {
   return { cuentas: {}, pending: {} };
 }
 
+// Si lo que hay guardado es del formato viejo (una sola cuenta, sin la
+// clave "cuentas"), lo convertimos al formato nuevo automáticamente,
+// para no perder la conexión que ya tenías hecha.
+function migrarSiHaceFalta(d) {
+  if (d.cuentas) return d; // ya está en el formato nuevo, no hay nada que hacer
+  if (!d.refresh_token) return datosVacios(); // no había ninguna cuenta conectada
+
+  const cuentaId = d.user_id ? String(d.user_id) : 'cuenta_1';
+  console.log(`🔄 Migrando datos viejos al formato nuevo (cuenta ${cuentaId})...`);
+
+  return {
+    cuentas: {
+      [cuentaId]: {
+        nombre: `Cuenta ${cuentaId}`,
+        chat_id: null,
+        access_token: d.access_token,
+        refresh_token: d.refresh_token,
+        expires_at: d.expires_at,
+        notificadas: d.notificadas || [],
+        ventas_notificadas: d.ventas_notificadas || [],
+        ventas_inicializado: d.ventas_inicializado || false,
+        reclamos_notificados: d.reclamos_notificados || [],
+        reclamos_inicializado: d.reclamos_inicializado || false,
+        stock_alertado: d.stock_alertado || {},
+      },
+    },
+    pending: {}, // los "pendientes de responder" viejos no son compatibles; se descartan
+  };
+}
+
 async function loadData() {
   try {
     const res = await axios.get(`${UPSTASH_REDIS_REST_URL}/get/botdata`, { headers: upstashHeaders });
     if (!res.data.result) return datosVacios();
-    return JSON.parse(res.data.result);
+    const migrado = migrarSiHaceFalta(JSON.parse(res.data.result));
+    return migrado;
   } catch (err) {
     console.error('Error leyendo memoria del bot:', err.response?.data || err.message);
     return datosVacios();
@@ -745,6 +776,7 @@ app.get('/debug/feeds', async (req, res) => {
 
 async function start() {
   data = await loadData();
+  await saveData(data); // por si se acaba de migrar del formato viejo
   app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
   setInterval(revisarTodo, 60 * 1000); // cada 1 minuto
   revisarTodo(); // y una vez apenas arranca
