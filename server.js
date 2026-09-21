@@ -1054,7 +1054,18 @@ const {
   GOOGLE_SHEET_ID,
   GOOGLE_SHEET_TAB = 'Hoja 1',
   HORA_ETIQUETAS_VENTAS = '09:00',
+  DIAS_VENTANA_ETIQUETAS_VENTAS = '3',
 } = process.env;
+
+const VENTANA_DIAS = Number(DIAS_VENTANA_ETIQUETAS_VENTAS) || 3;
+
+// Ventas de hasta VENTANA_DIAS días atrás (para agarrar las que
+// llegaron tarde ayer), pero sin traer historial viejo de semanas.
+function esVentaReciente(fechaISO) {
+  const limite = new Date();
+  limite.setDate(limite.getDate() - VENTANA_DIAS);
+  return new Date(fechaISO) >= limite;
+}
 
 // ---------------------------------------------------------------------
 // Google Sheets
@@ -1203,12 +1214,31 @@ async function enviarPDFPorTelegram(chatId, buffer, nombreArchivo, caption) {
 // Corrida diaria: recorre las 3 cuentas, arma la planilla y las etiquetas
 // ---------------------------------------------------------------------
 
+// Candado para que nunca haya dos corridas al mismo tiempo (por
+// ejemplo el chequeo automático de cada 1 minuto solapándose con una
+// prueba manual desde /debug/run-etiquetas-ventas). Sin esto, dos
+// corridas en simultáneo pueden terminar escribiendo las mismas
+// ventas dos veces en la planilla.
+let etiquetasVentasEnCurso = false;
+
 async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
   const hoy = fechaHoyAR();
   if (!forzar && data.etiquetas_ventas_ultima_fecha === hoy) {
     return { ok: true, motivo: 'Ya se había corrido hoy.', filas: 0, etiquetas: 0 };
   }
+  if (etiquetasVentasEnCurso) {
+    return { ok: true, motivo: 'Ya hay una corrida en curso, se saltea esta.', filas: 0, etiquetas: 0 };
+  }
+  etiquetasVentasEnCurso = true;
 
+  try {
+    return await ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy });
+  } finally {
+    etiquetasVentasEnCurso = false;
+  }
+}
+
+async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
   const buffersEtiquetas = [];
   const filasPlanilla = [];
   const marcasPendientes = []; // { cuenta, ordenId } - se confirman solo si la planilla se escribe bien
@@ -1228,12 +1258,13 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
         params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 50 },
         headers: { Authorization: `Bearer ${token}` },
       });
-      // OJO: ya NO filtramos "solo las ventas de hoy". Si una venta
-      // llega después de la corrida diaria, se procesa en la corrida
-      // siguiente en vez de perderse para siempre (lo que evita
-      // repetir una misma venta es que su ID ya está guardado en
-      // filas_planilla_cargadas / etiquetas_generadas, no la fecha).
-      const ordenesPendientes = resp.results || [];
+      // Ya no filtramos "solo las ventas de HOY" (para no perder una
+      // venta que llegó tarde a la noche), pero tampoco traemos
+      // historial viejo sin límite: nos quedamos con los últimos
+      // VENTANA_DIAS días. Lo que evita repetir una misma venta ya
+      // procesada es que su ID está guardado en
+      // filas_planilla_cargadas / etiquetas_generadas, no la fecha.
+      const ordenesPendientes = (resp.results || []).filter((o) => esVentaReciente(o.date_created));
 
       // La primera vez que se activa esto en una cuenta, no queremos
       // volcar de golpe meses de historial viejo: tomamos nota en
