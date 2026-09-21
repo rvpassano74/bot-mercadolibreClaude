@@ -1249,7 +1249,6 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
     if (!cuenta.refresh_token) continue;
     if (!Array.isArray(cuenta.etiquetas_generadas)) cuenta.etiquetas_generadas = [];
     if (!Array.isArray(cuenta.filas_planilla_cargadas)) cuenta.filas_planilla_cargadas = [];
-    if (typeof cuenta.etiquetas_ventas_inicializado === 'undefined') cuenta.etiquetas_ventas_inicializado = false;
 
     try {
       const token = await getAccessToken(cuentaId);
@@ -1265,21 +1264,6 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
       // procesada es que su ID está guardado en
       // filas_planilla_cargadas / etiquetas_generadas, no la fecha.
       const ordenesPendientes = (resp.results || []).filter((o) => esVentaReciente(o.date_created));
-
-      // La primera vez que se activa esto en una cuenta, no queremos
-      // volcar de golpe meses de historial viejo: tomamos nota en
-      // silencio de lo que ya está pagado hasta ahora (sin generar
-      // filas ni etiquetas), y de ahí en más seguimos solo con lo
-      // nuevo. Mismo patrón que ya usa el bot para preguntas/ventas/
-      // reclamos la primera vez que conectás una cuenta.
-      if (!cuenta.etiquetas_ventas_inicializado) {
-        cuenta.filas_planilla_cargadas = ordenesPendientes.map((o) => o.id);
-        cuenta.etiquetas_generadas = ordenesPendientes.filter((o) => o.shipping?.id).map((o) => o.shipping.id);
-        cuenta.etiquetas_ventas_inicializado = true;
-        await saveData(data);
-        console.log(`📦🧾 [${cuenta.nombre}] primer barrido: ${ordenesPendientes.length} venta(s) existentes sin cargar (no se generan filas ni etiquetas esta vez).`);
-        continue;
-      }
 
       // --- Filas nuevas para la planilla ---
       // OJO: acá NO marcamos todavía la orden como "ya cargada". Se
@@ -1435,26 +1419,23 @@ app.get('/debug/test-sheet', async (req, res) => {
   }
 });
 
-// Reseteo completo de la parte de "planilla" para una cuenta: borra la
-// lista de ventas ya cargadas Y vuelve a poner el "primer barrido" en
-// false. Efecto práctico: la PRÓXIMA corrida no va a cargar nada
-// (hace de nuevo el barrido silencioso), y recién la corrida
-// SIGUIENTE a esa arranca limpia, cargando solo ventas nuevas de
-// verdad (últimos 3 días). Pensado para usar una sola vez, después de
-// vaciar a mano lo que el bot haya escrito de más en la planilla.
+// Borra la lista de ventas "ya cargadas" de una cuenta. Efecto
+// práctico: la próxima corrida vuelve a mirar los últimos 3 días de
+// ventas pagadas y carga en la planilla las que todavía no estén ahí.
+// Pensado para usar después de vaciar a mano lo que el bot haya
+// escrito de más en la planilla.
 app.get('/debug/reset-planilla', async (req, res) => {
   const { id: cuentaId, error } = resolverCuentaId(req);
   if (error) return res.status(400).json({ error });
   const cuenta = data.cuentas[cuentaId];
   const cantidadAntes = (cuenta.filas_planilla_cargadas || []).length;
   cuenta.filas_planilla_cargadas = [];
-  cuenta.etiquetas_ventas_inicializado = false;
   await saveData(data);
   res.json({
     ok: true,
     cuenta: cuenta.nombre,
     marcas_borradas: cantidadAntes,
-    aviso: 'La próxima corrida no va a cargar nada (barrido silencioso). Recién la corrida siguiente carga ventas nuevas de verdad.',
+    aviso: 'La próxima corrida ya va a cargar en la planilla las ventas de los últimos 3 días que todavía no estén ahí.',
   });
 });
 
