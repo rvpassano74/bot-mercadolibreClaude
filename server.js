@@ -1055,9 +1055,19 @@ const {
   GOOGLE_SHEET_TAB = 'Hoja 1',
   HORA_ETIQUETAS_VENTAS = '09:00',
   DIAS_VENTANA_ETIQUETAS_VENTAS = '3',
+  PLANILLA_VENTAS_ACTIVA,
 } = process.env;
 
 const VENTANA_DIAS = Number(DIAS_VENTANA_ETIQUETAS_VENTAS) || 3;
+
+// Interruptor para pausar SOLO la carga automática a la planilla de
+// Google Sheets, sin tocar nada de las etiquetas (que siguen andando
+// igual). Por defecto queda APAGADA: hay que poner la variable de
+// entorno PLANILLA_VENTAS_ACTIVA=si en Render para volver a prenderla
+// más adelante.
+const PLANILLA_ACTIVA = ['si', 'sí', 'true', '1'].includes(
+  (PLANILLA_VENTAS_ACTIVA || '').toLowerCase().trim()
+);
 
 // Ventas de hasta VENTANA_DIAS días atrás (para agarrar las que
 // llegaron tarde ayer), pero sin traer historial viejo de semanas.
@@ -1101,7 +1111,8 @@ async function agregarFilasAPlanilla(filas) {
   if (!filas.length) return;
   const sheets = await clienteSheets();
   const values = filas.map((f) => [
-    f.id,
+    `'${f.id}`, // el ' al principio obliga a Sheets a guardarlo como texto,
+    // así no redondea los últimos dígitos de números de venta largos
     f.fecha,
     f.nombre,
     f.dni,
@@ -1274,15 +1285,17 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
       // en silencio (esto es justo lo que pasó: las etiquetas se
       // generaron pero la planilla falló, y las ventas quedaban
       // marcadas como "hechas" igual).
-      for (const orden of ordenesPendientes) {
-        if (cuenta.filas_planilla_cargadas.includes(orden.id)) continue;
-        try {
-          const fila = await armarFilaPlanilla(orden, token);
-          filasPlanilla.push(fila);
-          marcasPendientes.push({ cuenta, ordenId: orden.id });
-        } catch (err) {
-          console.error(`Error armando fila de planilla (orden ${orden.id}):`, err.response?.data || err.message);
-          huboError = true;
+      if (PLANILLA_ACTIVA) {
+        for (const orden of ordenesPendientes) {
+          if (cuenta.filas_planilla_cargadas.includes(orden.id)) continue;
+          try {
+            const fila = await armarFilaPlanilla(orden, token);
+            filasPlanilla.push(fila);
+            marcasPendientes.push({ cuenta, ordenId: orden.id });
+          } catch (err) {
+            console.error(`Error armando fila de planilla (orden ${orden.id}):`, err.response?.data || err.message);
+            huboError = true;
+          }
         }
       }
 
@@ -1336,10 +1349,11 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
   if (buffersEtiquetas.length) {
     try {
       const combinado = await combinarPDFs(buffersEtiquetas);
-      const avisoPlanilla =
-        filasGuardadas === filasPlanilla.length
-          ? `${filasGuardadas} venta(s) cargada(s) en la planilla.`
-          : `⚠️ Ojo: la planilla de Google Sheets falló al guardar (revisar Logs de Render). Las etiquetas sí están OK.`;
+      const avisoPlanilla = !PLANILLA_ACTIVA
+        ? 'La carga automática a la planilla está pausada por ahora.'
+        : filasGuardadas === filasPlanilla.length
+        ? `${filasGuardadas} venta(s) cargada(s) en la planilla.`
+        : `⚠️ Ojo: la planilla de Google Sheets falló al guardar (revisar Logs de Render). Las etiquetas sí están OK.`;
       await enviarPDFPorTelegram(
         TELEGRAM_CHAT_ID,
         combinado,
@@ -1436,6 +1450,23 @@ app.get('/debug/reset-planilla', async (req, res) => {
     cuenta: cuenta.nombre,
     marcas_borradas: cantidadAntes,
     aviso: 'La próxima corrida ya va a cargar en la planilla las ventas de los últimos 3 días que todavía no estén ahí.',
+  });
+});
+
+// Diagnóstico: muestra, tal cual los tiene guardados el bot en su
+// memoria (sin pasar por Google Sheets), los números de venta que ya
+// marcó como "cargados" para una cuenta. Sirve para comparar contra lo
+// que aparece escrito en la planilla y detectar si algún número quedó
+// mal guardado en Sheets.
+app.get('/debug/ids-cargados', (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const cuenta = data.cuentas[cuentaId];
+  if (!cuenta) return res.status(404).json({ error: 'No encontré esa cuenta.' });
+  res.json({
+    cuenta: cuenta.nombre || cuentaId,
+    cantidad: (cuenta.filas_planilla_cargadas || []).length,
+    ids: cuenta.filas_planilla_cargadas || [],
   });
 });
 
