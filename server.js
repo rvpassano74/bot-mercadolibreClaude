@@ -1435,22 +1435,27 @@ app.get('/debug/test-sheet', async (req, res) => {
   }
 });
 
-// Recuperación puntual: si alguna vez la planilla falla y ventas
-// quedaron marcadas como "cargadas" sin llegar a escribirse de
-// verdad (por un bug ya corregido, o algún otro motivo futuro), esto
-// las vuelve a marcar como pendientes para que la próxima corrida las
-// reintente. Usar con cuidado: si corrés esto en una cuenta que ya
-// tenía ventas correctamente cargadas hace tiempo, esas también se
-// van a volver a intentar cargar (duplicando filas). Pensado para usar
-// una sola vez, apenas después de detectar un problema.
+// Reseteo completo de la parte de "planilla" para una cuenta: borra la
+// lista de ventas ya cargadas Y vuelve a poner el "primer barrido" en
+// false. Efecto práctico: la PRÓXIMA corrida no va a cargar nada
+// (hace de nuevo el barrido silencioso), y recién la corrida
+// SIGUIENTE a esa arranca limpia, cargando solo ventas nuevas de
+// verdad (últimos 3 días). Pensado para usar una sola vez, después de
+// vaciar a mano lo que el bot haya escrito de más en la planilla.
 app.get('/debug/reset-planilla', async (req, res) => {
   const { id: cuentaId, error } = resolverCuentaId(req);
   if (error) return res.status(400).json({ error });
   const cuenta = data.cuentas[cuentaId];
   const cantidadAntes = (cuenta.filas_planilla_cargadas || []).length;
   cuenta.filas_planilla_cargadas = [];
+  cuenta.etiquetas_ventas_inicializado = false;
   await saveData(data);
-  res.json({ ok: true, cuenta: cuenta.nombre, marcas_borradas: cantidadAntes });
+  res.json({
+    ok: true,
+    cuenta: cuenta.nombre,
+    marcas_borradas: cantidadAntes,
+    aviso: 'La próxima corrida no va a cargar nada (barrido silencioso). Recién la corrida siguiente carga ventas nuevas de verdad.',
+  });
 });
 
 async function start() {
