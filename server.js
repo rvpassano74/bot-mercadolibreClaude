@@ -883,9 +883,31 @@ app.get('/debug/feeds', async (req, res) => {
   }
 });
 
+// Las cuentas migradas del formato viejo quedaron con un nombre
+// genérico ("Cuenta 12345"), porque en ese momento no teníamos forma
+// de saber su apodo real. Lo buscamos una sola vez.
+async function corregirNombresGenericos() {
+  for (const cuentaId of Object.keys(data.cuentas || {})) {
+    const cuenta = data.cuentas[cuentaId];
+    if (cuenta.nombre !== `Cuenta ${cuentaId}`) continue; // ya tiene un nombre real
+    try {
+      const token = await getAccessToken(cuentaId);
+      const { data: usuario } = await axios.get('https://api.mercadolibre.com/users/me', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      cuenta.nombre = usuario.nickname || cuenta.nombre;
+      await saveData(data);
+      console.log(`✏️ Nombre actualizado para la cuenta ${cuentaId}: ${cuenta.nombre}`);
+    } catch (err) {
+      console.error(`No se pudo actualizar el nombre de la cuenta ${cuentaId}:`, err.response?.data || err.message);
+    }
+  }
+}
+
 async function start() {
   data = await loadData();
   await saveData(data); // por si se acaba de migrar del formato viejo
+  await corregirNombresGenericos();
   app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
   setInterval(revisarTodo, 60 * 1000); // cada 1 minuto
   revisarTodo(); // y una vez apenas arranca
