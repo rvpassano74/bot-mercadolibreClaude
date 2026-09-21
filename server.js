@@ -57,7 +57,12 @@ const STOCK_MINIMO = 2; // avisar cuando quedan esta cantidad o menos
 const upstashHeaders = { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` };
 
 function datosVacios() {
-  return { cuentas: {}, pending: {}, resumen_diario: { fecha: null, totales: {}, enviado: false } };
+  return {
+    cuentas: {},
+    pending: {},
+    resumen_periodo: { totales: {}, flex: 0, normal: 0, otros: 0 },
+    resumen_ultima_fecha_enviada: null,
+  };
 }
 
 const ZONA_HORARIA = 'America/Argentina/Buenos_Aires';
@@ -376,6 +381,21 @@ function formatearMoneda(monto, moneda) {
   return `${moneda === 'ARS' ? '$' : moneda + ' '}${Number(monto).toLocaleString('es-AR')}`;
 }
 
+// Consulta si un envío es "Flex" (self_service) o "Normal" (cualquier
+// otro tipo de logística de Mercado Envíos).
+async function obtenerTipoEnvio(token, shippingId) {
+  if (!shippingId) return 'Sin envío';
+  try {
+    const { data: envio } = await axios.get(`https://api.mercadolibre.com/shipments/${shippingId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return envio.logistic_type === 'self_service' ? 'Flex' : 'Normal';
+  } catch (err) {
+    console.error('Error consultando tipo de envío:', err.response?.data || err.message);
+    return 'Desconocido';
+  }
+}
+
 async function revisarVentasNuevas() {
   for (const cuentaId of Object.keys(data.cuentas || {})) {
     const cuenta = data.cuentas[cuentaId];
@@ -408,6 +428,7 @@ async function revisarVentasNuevas() {
           .join('\n');
         const comprador = orden.buyer?.nickname || 'Comprador';
         const total = formatearMoneda(orden.total_amount, orden.currency_id);
+        const tipoEnvio = await obtenerTipoEnvio(token, orden.shipping?.id);
 
         const texto =
           `🏪 Cuenta: ${cuenta.nombre}\n\n` +
@@ -415,25 +436,20 @@ async function revisarVentasNuevas() {
           `🧾 Orden: ${orden.id}\n` +
           `👤 Comprador: ${comprador}\n` +
           `📦 Producto(s):\n${productos}\n\n` +
+          `🚚 Envío: ${tipoEnvio}\n` +
           `💵 Total: ${total}`;
 
         await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatDe(cuenta), text: texto });
 
-        // Además del aviso en el chat propio de la cuenta, mandamos una
-        // línea corta al chat de resumen combinado (si está configurado),
-        // para tener ahí el total de ventas de todas las cuentas juntas.
-        if (TELEGRAM_CHAT_ID_RESUMEN) {
-          const textoResumen = `💰 Venta en ${cuenta.nombre}: ${total} (orden ${orden.id})`;
-          await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: textoResumen });
-        }
-
-        // Sumamos esta venta al acumulado del día, para el resumen diario.
-        if (!data.resumen_diario) data.resumen_diario = { fecha: null, totales: {}, enviado: false };
-        if (data.resumen_diario.fecha !== fechaHoyAR()) {
-          data.resumen_diario = { fecha: fechaHoyAR(), totales: {}, enviado: false };
-        }
-        data.resumen_diario.totales[cuentaId] =
-          (data.resumen_diario.totales[cuentaId] || 0) + Number(orden.total_amount);
+        // Ya NO mandamos una línea por venta al chat de resumen: ahí solo
+        // va el informe combinado una vez al día (ver revisarResumenDiario).
+        // Acá solo acumulamos los datos para ese informe.
+        if (!data.resumen_periodo) data.resumen_periodo = { totales: {}, flex: 0, normal: 0, otros: 0 };
+        data.resumen_periodo.totales[cuentaId] =
+          (data.resumen_periodo.totales[cuentaId] || 0) + Number(orden.total_amount);
+        if (tipoEnvio === 'Flex') data.resumen_periodo.flex++;
+        else if (tipoEnvio === 'Normal') data.resumen_periodo.normal++;
+        else data.resumen_periodo.otros++;
 
         cuenta.ventas_notificadas.push(orden.id);
       }
@@ -568,39 +584,52 @@ async function revisarStockBajo() {
 }
 
 // =====================================================================
-// RESUMEN DIARIO: a las 23:55 (hora Argentina) manda al chat de
-// resumen el total vendido por cada cuenta ese día, más el total
-// combinado.
+// RESUMEN DIARIO: una sola vez al día, a las 12:00 (hora Argentina),
+// manda al chat de resumen el total facturado por cada cuenta en las
+// últimas 24hs (de 12:00 a 12:00), más cuántas ventas fueron con envío
+// Flex y cuántas con envío Normal.
 // =====================================================================
 
-function armarTextoResumenDiario(resumen) {
-  const entradas = Object.entries(resumen.totales || {});
-  if (entradas.length === 0) return null;
+const HORA_DE_CORTE = '12:00';
 
-  const lineas = entradas.map(([cuentaId, total]) => {
-    const nombre = data.cuentas[cuentaId]?.nombre || `Cuenta ${cuentaId}`;
-    return `• ${nombre}: ${formatearMoneda(total, 'ARS')}`;
-  });
+function resumenPeriodoVacio() {
+  return { totales: {}, flex: 0, normal: 0, otros: 0 };
+}
+
+function armarTextoResumenPeriodo(resumen) {
+  const entradas = Object.entries(resumen.totales || {});
   const totalCombinado = entradas.reduce((suma, [, total]) => suma + total, 0);
+  const totalVentas = resumen.flex + resumen.normal + resumen.otros;
+
+  const lineas = entradas.length
+    ? entradas.map(([cuentaId, total]) => {
+        const nombre = data.cuentas[cuentaId]?.nombre || `Cuenta ${cuentaId}`;
+        return `• ${nombre}: ${formatearMoneda(total, 'ARS')}`;
+      })
+    : ['Sin ventas en las últimas 24hs.'];
+
+  let textoEnvios = `🚚 Envíos: ${resumen.flex} Flex / ${resumen.normal} Normal`;
+  if (resumen.otros > 0) textoEnvios += ` / ${resumen.otros} otros`;
 
   return (
-    `📊 Resumen del día (${resumen.fecha})\n\n` +
+    `📊 Resumen de ventas (últimas 24hs, corte ${HORA_DE_CORTE})\n\n` +
     `${lineas.join('\n')}\n\n` +
-    `💰 Total combinado: ${formatearMoneda(totalCombinado, 'ARS')}`
+    `💰 Total combinado: ${formatearMoneda(totalCombinado, 'ARS')}\n` +
+    (totalVentas > 0 ? textoEnvios : '')
   );
 }
 
 async function revisarResumenDiario() {
   if (!TELEGRAM_CHAT_ID_RESUMEN) return;
-  if (!data.resumen_diario || data.resumen_diario.fecha !== fechaHoyAR()) return; // no hay nada acumulado hoy
-  if (data.resumen_diario.enviado) return; // ya se mandó hoy
-  if (horaAhoraAR() < '23:55') return; // todavía no es la hora
+  const hoy = fechaHoyAR();
+  if (data.resumen_ultima_fecha_enviada === hoy) return; // ya se mandó hoy
+  if (horaAhoraAR() < HORA_DE_CORTE) return; // todavía no es la hora
 
-  const texto = armarTextoResumenDiario(data.resumen_diario);
-  if (!texto) return;
-
+  const texto = armarTextoResumenPeriodo(data.resumen_periodo || resumenPeriodoVacio());
   await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: texto });
-  data.resumen_diario.enviado = true;
+
+  data.resumen_periodo = resumenPeriodoVacio(); // arrancamos de cero para las próximas 24hs
+  data.resumen_ultima_fecha_enviada = hoy;
   await saveData(data);
   console.log('📊 Resumen diario enviado.');
 }
@@ -752,6 +781,7 @@ app.get('/debug/simulate-order', async (req, res) => {
     const productos = (orden.order_items || []).map((it) => `• ${it.quantity} x ${it.item.title}`).join('\n');
     const comprador = orden.buyer?.nickname || 'Comprador';
     const total = formatearMoneda(orden.total_amount, orden.currency_id);
+    const tipoEnvio = await obtenerTipoEnvio(token, orden.shipping?.id);
     const cuenta = data.cuentas[cuentaId];
     const texto =
       `🏪 Cuenta: ${cuenta.nombre}\n\n` +
@@ -759,21 +789,18 @@ app.get('/debug/simulate-order', async (req, res) => {
       `🧾 Orden: ${orden.id}\n` +
       `👤 Comprador: ${comprador}\n` +
       `📦 Producto(s):\n${productos}\n\n` +
+      `🚚 Envío: ${tipoEnvio}\n` +
       `💵 Total: ${total}`;
     await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatDe(cuenta), text: texto });
 
-    if (TELEGRAM_CHAT_ID_RESUMEN) {
-      const textoResumen = `💰 Venta en ${cuenta.nombre}: ${total} (orden ${orden.id}) (prueba)`;
-      await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: textoResumen });
-    }
-
-    if (!data.resumen_diario || data.resumen_diario.fecha !== fechaHoyAR()) {
-      data.resumen_diario = { fecha: fechaHoyAR(), totales: {}, enviado: false };
-    }
-    data.resumen_diario.totales[cuentaId] = (data.resumen_diario.totales[cuentaId] || 0) + Number(orden.total_amount);
+    if (!data.resumen_periodo) data.resumen_periodo = resumenPeriodoVacio();
+    data.resumen_periodo.totales[cuentaId] = (data.resumen_periodo.totales[cuentaId] || 0) + Number(orden.total_amount);
+    if (tipoEnvio === 'Flex') data.resumen_periodo.flex++;
+    else if (tipoEnvio === 'Normal') data.resumen_periodo.normal++;
+    else data.resumen_periodo.otros++;
     await saveData(data);
 
-    res.json({ ok: true });
+    res.json({ ok: true, tipoEnvio });
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
   }
@@ -797,20 +824,26 @@ app.get('/debug/test-resumen', async (req, res) => {
   }
 });
 
-// Muestra (sin mandar nada a Telegram) cómo va el acumulado del día.
+// Muestra (sin mandar nada a Telegram) cómo va el acumulado del
+// período actual (desde el último resumen enviado).
 app.get('/debug/resumen-diario', (req, res) => {
-  res.json(data.resumen_diario || { fecha: null, totales: {} });
+  res.json({
+    periodo_actual: data.resumen_periodo || resumenPeriodoVacio(),
+    ultima_fecha_enviada: data.resumen_ultima_fecha_enviada,
+    hora_de_corte: HORA_DE_CORTE,
+    hora_actual_argentina: horaAhoraAR(),
+  });
 });
 
-// Manda el resumen diario a Telegram ahora mismo, sin esperar a las
-// 23:55, para poder ver cómo queda el mensaje.
+// Manda el resumen a Telegram ahora mismo, sin esperar a las 12:00,
+// para poder ver cómo queda el mensaje. OJO: esto NO reinicia el
+// acumulado ni marca el día como "ya enviado" (es solo una previsualización).
 app.get('/debug/test-resumen-diario', async (req, res) => {
   if (!TELEGRAM_CHAT_ID_RESUMEN) {
     return res.status(400).json({ error: 'La variable TELEGRAM_CHAT_ID_RESUMEN no está configurada en Render.' });
   }
-  const texto = armarTextoResumenDiario(data.resumen_diario || {});
-  if (!texto) return res.json({ ok: false, motivo: 'Todavía no hay ninguna venta acumulada hoy.' });
-  await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: `${texto}\n\n(prueba manual)` });
+  const texto = armarTextoResumenPeriodo(data.resumen_periodo || resumenPeriodoVacio());
+  await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: `${texto}\n\n(prueba manual, no reinicia el acumulado)` });
   res.json({ ok: true });
 });
 
