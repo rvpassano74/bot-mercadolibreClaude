@@ -1211,6 +1211,7 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
 
   const buffersEtiquetas = [];
   const filasPlanilla = [];
+  const marcasPendientes = []; // { cuenta, ordenId } - se confirman solo si la planilla se escribe bien
   let huboError = false;
 
   for (const cuentaId of Object.keys(data.cuentas || {})) {
@@ -1250,12 +1251,20 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
       }
 
       // --- Filas nuevas para la planilla ---
+      // OJO: acá NO marcamos todavía la orden como "ya cargada". Se
+      // marca recién más abajo, después de que agregarFilasAPlanilla()
+      // haya escrito bien en Google Sheets. Si el guardado en la
+      // planilla falla, estas ventas quedan pendientes y se
+      // reintentan solas en la corrida siguiente, en vez de perderse
+      // en silencio (esto es justo lo que pasó: las etiquetas se
+      // generaron pero la planilla falló, y las ventas quedaban
+      // marcadas como "hechas" igual).
       for (const orden of ordenesPendientes) {
         if (cuenta.filas_planilla_cargadas.includes(orden.id)) continue;
         try {
           const fila = await armarFilaPlanilla(orden, token);
           filasPlanilla.push(fila);
-          cuenta.filas_planilla_cargadas.push(orden.id);
+          marcasPendientes.push({ cuenta, ordenId: orden.id });
         } catch (err) {
           console.error(`Error armando fila de planilla (orden ${orden.id}):`, err.response?.data || err.message);
           huboError = true;
@@ -1289,10 +1298,18 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
     }
   }
 
-  // Guardar filas en la planilla de Google Sheets
+  // Guardar filas en la planilla de Google Sheets. Solo si esto sale
+  // bien confirmamos las marcas de "ya cargada" — así, si falla, se
+  // reintenta solo en la próxima corrida en vez de perder esas ventas.
+  let filasGuardadas = 0;
   if (filasPlanilla.length) {
     try {
       await agregarFilasAPlanilla(filasPlanilla);
+      for (const { cuenta, ordenId } of marcasPendientes) {
+        cuenta.filas_planilla_cargadas.push(ordenId);
+      }
+      filasGuardadas = filasPlanilla.length;
+      await saveData(data);
     } catch (err) {
       console.error('Error escribiendo en la planilla de Google Sheets:', err.response?.data || err.message);
       huboError = true;
@@ -1304,28 +1321,36 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
   if (buffersEtiquetas.length) {
     try {
       const combinado = await combinarPDFs(buffersEtiquetas);
+      const avisoPlanilla =
+        filasGuardadas === filasPlanilla.length
+          ? `${filasGuardadas} venta(s) cargada(s) en la planilla.`
+          : `⚠️ Ojo: la planilla de Google Sheets falló al guardar (revisar Logs de Render). Las etiquetas sí están OK.`;
       await enviarPDFPorTelegram(
         TELEGRAM_CHAT_ID,
         combinado,
         `etiquetas_${hoy}.pdf`,
-        `📦 Etiquetas del ${hoy} — ${filasPlanilla.length} venta(s) cargada(s) en la planilla.`
+        `📦 Etiquetas del ${hoy} — ${avisoPlanilla}`
       );
       pdfEnviado = true;
     } catch (err) {
       console.error('Error combinando/mandando el PDF de etiquetas:', err.response?.data || err.message);
       huboError = true;
     }
-  } else if (!forzar) {
+  } else if (!forzar && data.etiquetas_ventas_aviso_vacio_fecha !== hoy) {
+    // Se avisa una sola vez por día (aunque el proceso se reintente
+    // varias veces por algún error en la planilla), para no repetir
+    // el mismo mensaje de Telegram cada 1 minuto.
     await axios.post(`${TELEGRAM_API}/sendMessage`, {
       chat_id: TELEGRAM_CHAT_ID,
       text: `📦 No hay etiquetas nuevas para imprimir hoy (${hoy}).`,
     });
+    data.etiquetas_ventas_aviso_vacio_fecha = hoy;
   }
 
   if (!huboError) data.etiquetas_ventas_ultima_fecha = hoy;
   await saveData(data);
 
-  return { ok: !huboError, filas: filasPlanilla.length, etiquetas: buffersEtiquetas.length, pdfEnviado };
+  return { ok: !huboError, filas: filasGuardadas, filasIntentadas: filasPlanilla.length, etiquetas: buffersEtiquetas.length, pdfEnviado };
 }
 
 // Se llama cada 1 minuto (enganchado desde revisarTodo). Solo actúa
@@ -1377,6 +1402,24 @@ app.get('/debug/test-sheet', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
   }
+});
+
+// Recuperación puntual: si alguna vez la planilla falla y ventas
+// quedaron marcadas como "cargadas" sin llegar a escribirse de
+// verdad (por un bug ya corregido, o algún otro motivo futuro), esto
+// las vuelve a marcar como pendientes para que la próxima corrida las
+// reintente. Usar con cuidado: si corrés esto en una cuenta que ya
+// tenía ventas correctamente cargadas hace tiempo, esas también se
+// van a volver a intentar cargar (duplicando filas). Pensado para usar
+// una sola vez, apenas después de detectar un problema.
+app.get('/debug/reset-planilla', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const cuenta = data.cuentas[cuentaId];
+  const cantidadAntes = (cuenta.filas_planilla_cargadas || []).length;
+  cuenta.filas_planilla_cargadas = [];
+  await saveData(data);
+  res.json({ ok: true, cuenta: cuenta.nombre, marcas_borradas: cantidadAntes });
 });
 
 async function start() {
