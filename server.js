@@ -57,7 +57,22 @@ const STOCK_MINIMO = 2; // avisar cuando quedan esta cantidad o menos
 const upstashHeaders = { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` };
 
 function datosVacios() {
-  return { cuentas: {}, pending: {} };
+  return { cuentas: {}, pending: {}, resumen_diario: { fecha: null, totales: {}, enviado: false } };
+}
+
+const ZONA_HORARIA = 'America/Argentina/Buenos_Aires';
+
+function fechaHoyAR() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: ZONA_HORARIA }).format(new Date()); // "YYYY-MM-DD"
+}
+
+function horaAhoraAR() {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: ZONA_HORARIA,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date()); // "HH:MM"
 }
 
 // Si lo que hay guardado es del formato viejo (una sola cuenta, sin la
@@ -412,6 +427,14 @@ async function revisarVentasNuevas() {
           await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: textoResumen });
         }
 
+        // Sumamos esta venta al acumulado del día, para el resumen diario.
+        if (!data.resumen_diario) data.resumen_diario = { fecha: null, totales: {}, enviado: false };
+        if (data.resumen_diario.fecha !== fechaHoyAR()) {
+          data.resumen_diario = { fecha: fechaHoyAR(), totales: {}, enviado: false };
+        }
+        data.resumen_diario.totales[cuentaId] =
+          (data.resumen_diario.totales[cuentaId] || 0) + Number(orden.total_amount);
+
         cuenta.ventas_notificadas.push(orden.id);
       }
 
@@ -544,11 +567,50 @@ async function revisarStockBajo() {
   }
 }
 
+// =====================================================================
+// RESUMEN DIARIO: a las 23:55 (hora Argentina) manda al chat de
+// resumen el total vendido por cada cuenta ese día, más el total
+// combinado.
+// =====================================================================
+
+function armarTextoResumenDiario(resumen) {
+  const entradas = Object.entries(resumen.totales || {});
+  if (entradas.length === 0) return null;
+
+  const lineas = entradas.map(([cuentaId, total]) => {
+    const nombre = data.cuentas[cuentaId]?.nombre || `Cuenta ${cuentaId}`;
+    return `• ${nombre}: ${formatearMoneda(total, 'ARS')}`;
+  });
+  const totalCombinado = entradas.reduce((suma, [, total]) => suma + total, 0);
+
+  return (
+    `📊 Resumen del día (${resumen.fecha})\n\n` +
+    `${lineas.join('\n')}\n\n` +
+    `💰 Total combinado: ${formatearMoneda(totalCombinado, 'ARS')}`
+  );
+}
+
+async function revisarResumenDiario() {
+  if (!TELEGRAM_CHAT_ID_RESUMEN) return;
+  if (!data.resumen_diario || data.resumen_diario.fecha !== fechaHoyAR()) return; // no hay nada acumulado hoy
+  if (data.resumen_diario.enviado) return; // ya se mandó hoy
+  if (horaAhoraAR() < '23:55') return; // todavía no es la hora
+
+  const texto = armarTextoResumenDiario(data.resumen_diario);
+  if (!texto) return;
+
+  await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: texto });
+  data.resumen_diario.enviado = true;
+  await saveData(data);
+  console.log('📊 Resumen diario enviado.');
+}
+
 async function revisarTodo() {
   await revisarPreguntasNuevas();
   await revisarVentasNuevas();
   await revisarReclamosNuevos();
   await revisarStockBajo();
+  await revisarResumenDiario();
 }
 
 // =====================================================================
@@ -727,6 +789,23 @@ app.get('/debug/test-resumen', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
   }
+});
+
+// Muestra (sin mandar nada a Telegram) cómo va el acumulado del día.
+app.get('/debug/resumen-diario', (req, res) => {
+  res.json(data.resumen_diario || { fecha: null, totales: {} });
+});
+
+// Manda el resumen diario a Telegram ahora mismo, sin esperar a las
+// 23:55, para poder ver cómo queda el mensaje.
+app.get('/debug/test-resumen-diario', async (req, res) => {
+  if (!TELEGRAM_CHAT_ID_RESUMEN) {
+    return res.status(400).json({ error: 'La variable TELEGRAM_CHAT_ID_RESUMEN no está configurada en Render.' });
+  }
+  const texto = armarTextoResumenDiario(data.resumen_diario || {});
+  if (!texto) return res.json({ ok: false, motivo: 'Todavía no hay ninguna venta acumulada hoy.' });
+  await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: `${texto}\n\n(prueba manual)` });
+  res.json({ ok: true });
 });
 
 app.get('/debug/list-claims', async (req, res) => {
