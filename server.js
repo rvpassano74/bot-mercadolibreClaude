@@ -1300,9 +1300,39 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
       }
 
       // --- Etiquetas nuevas para imprimir ---
-      const shipmentIdsNuevos = ordenesPendientes
-        .filter((o) => o.shipping?.id && !cuenta.etiquetas_generadas.includes(o.shipping.id))
-        .map((o) => o.shipping.id);
+      // Antes de meter una etiqueta en el PDF del día, le preguntamos a
+      // Mercado Libre si ese envío ya figura como "printed" (impreso).
+      // Esto pasa también si la imprimiste vos a mano desde la web de
+      // Mercado Libre, no solo si la bajó el bot — así evitamos
+      // repetirla al día siguiente. Si la consulta falla por algún
+      // motivo, la incluimos igual: mejor una etiqueta de más que
+      // perder una de verdad.
+      const candidatos = ordenesPendientes.filter(
+        (o) => o.shipping?.id && !cuenta.etiquetas_generadas.includes(o.shipping.id)
+      );
+
+      const shipmentIdsNuevos = [];
+      for (const orden of candidatos) {
+        const shipmentId = orden.shipping.id;
+        try {
+          const { data: envio } = await axios.get(`https://api.mercadolibre.com/shipments/${shipmentId}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (envio.substatus === 'printed') {
+            // Ya estaba impresa (por el bot antes, o a mano en Mercado
+            // Libre). La marcamos como generada pero no la volvemos a
+            // bajar ni a meter en el PDF.
+            cuenta.etiquetas_generadas.push(shipmentId);
+            continue;
+          }
+        } catch (err) {
+          console.error(
+            `(etiquetas) No se pudo consultar el estado del envío ${shipmentId}:`,
+            err.response?.data || err.message
+          );
+        }
+        shipmentIdsNuevos.push(shipmentId);
+      }
 
       for (const grupo of partirEnGrupos(shipmentIdsNuevos, 20)) {
         try {
