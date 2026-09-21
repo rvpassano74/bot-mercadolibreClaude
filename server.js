@@ -699,7 +699,31 @@ app.get('/debug/simulate-order', async (req, res) => {
       `📦 Producto(s):\n${productos}\n\n` +
       `💵 Total: ${total}`;
     await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: chatDe(cuenta), text: texto });
+
+    if (TELEGRAM_CHAT_ID_RESUMEN) {
+      const textoResumen = `💰 Venta en ${cuenta.nombre}: ${total} (orden ${orden.id}) (prueba)`;
+      await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: textoResumen });
+    }
+
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Prueba directa del chat de resumen combinado, sin pasar por ninguna
+// venta. Sirve para confirmar si la variable TELEGRAM_CHAT_ID_RESUMEN
+// está bien cargada y el bot puede mandarle mensajes a ese chat.
+app.get('/debug/test-resumen', async (req, res) => {
+  if (!TELEGRAM_CHAT_ID_RESUMEN) {
+    return res.status(400).json({ error: 'La variable TELEGRAM_CHAT_ID_RESUMEN no está configurada en Render.' });
+  }
+  try {
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: TELEGRAM_CHAT_ID_RESUMEN,
+      text: '✅ Prueba: este mensaje debería aparecer en el grupo de resumen combinado.',
+    });
+    res.json({ ok: true, chat_id_usado: TELEGRAM_CHAT_ID_RESUMEN });
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
   }
