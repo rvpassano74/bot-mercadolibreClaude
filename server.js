@@ -1218,6 +1218,7 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
     if (!cuenta.refresh_token) continue;
     if (!Array.isArray(cuenta.etiquetas_generadas)) cuenta.etiquetas_generadas = [];
     if (!Array.isArray(cuenta.filas_planilla_cargadas)) cuenta.filas_planilla_cargadas = [];
+    if (typeof cuenta.etiquetas_ventas_inicializado === 'undefined') cuenta.etiquetas_ventas_inicializado = false;
 
     try {
       const token = await getAccessToken(cuentaId);
@@ -1226,10 +1227,30 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
         params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 50 },
         headers: { Authorization: `Bearer ${token}` },
       });
-      const ordenesHoy = (resp.results || []).filter((o) => fechaDeAR(o.date_created) === hoy);
+      // OJO: ya NO filtramos "solo las ventas de hoy". Si una venta
+      // llega después de la corrida diaria, se procesa en la corrida
+      // siguiente en vez de perderse para siempre (lo que evita
+      // repetir una misma venta es que su ID ya está guardado en
+      // filas_planilla_cargadas / etiquetas_generadas, no la fecha).
+      const ordenesPendientes = resp.results || [];
+
+      // La primera vez que se activa esto en una cuenta, no queremos
+      // volcar de golpe meses de historial viejo: tomamos nota en
+      // silencio de lo que ya está pagado hasta ahora (sin generar
+      // filas ni etiquetas), y de ahí en más seguimos solo con lo
+      // nuevo. Mismo patrón que ya usa el bot para preguntas/ventas/
+      // reclamos la primera vez que conectás una cuenta.
+      if (!cuenta.etiquetas_ventas_inicializado) {
+        cuenta.filas_planilla_cargadas = ordenesPendientes.map((o) => o.id);
+        cuenta.etiquetas_generadas = ordenesPendientes.filter((o) => o.shipping?.id).map((o) => o.shipping.id);
+        cuenta.etiquetas_ventas_inicializado = true;
+        await saveData(data);
+        console.log(`📦🧾 [${cuenta.nombre}] primer barrido: ${ordenesPendientes.length} venta(s) existentes sin cargar (no se generan filas ni etiquetas esta vez).`);
+        continue;
+      }
 
       // --- Filas nuevas para la planilla ---
-      for (const orden of ordenesHoy) {
+      for (const orden of ordenesPendientes) {
         if (cuenta.filas_planilla_cargadas.includes(orden.id)) continue;
         try {
           const fila = await armarFilaPlanilla(orden, token);
@@ -1242,7 +1263,7 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
       }
 
       // --- Etiquetas nuevas para imprimir ---
-      const shipmentIdsNuevos = ordenesHoy
+      const shipmentIdsNuevos = ordenesPendientes
         .filter((o) => o.shipping?.id && !cuenta.etiquetas_generadas.includes(o.shipping.id))
         .map((o) => o.shipping.id);
 
