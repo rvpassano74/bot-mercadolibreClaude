@@ -767,6 +767,12 @@ app.get('/debug/simulate-order', async (req, res) => {
       await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: textoResumen });
     }
 
+    if (!data.resumen_diario || data.resumen_diario.fecha !== fechaHoyAR()) {
+      data.resumen_diario = { fecha: fechaHoyAR(), totales: {}, enviado: false };
+    }
+    data.resumen_diario.totales[cuentaId] = (data.resumen_diario.totales[cuentaId] || 0) + Number(orden.total_amount);
+    await saveData(data);
+
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
