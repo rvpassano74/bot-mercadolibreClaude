@@ -1,6 +1,9 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const { google } = require('googleapis');
+const { PDFDocument } = require('pdf-lib');
+const FormData = require('form-data');
 
 const app = express();
 app.use(express.json());
@@ -729,6 +732,7 @@ async function revisarTodo() {
   await revisarReclamosNuevos();
   await revisarStockBajo();
   await revisarResumenDiario();
+  await revisarEtiquetasYVentas();
 }
 
 // =====================================================================
@@ -1040,6 +1044,319 @@ async function corregirNombresGenericos() {
     }
   }
 }
+
+// =====================================================================
+// ETIQUETAS + PLANILLA DE VENTAS (agregado)
+// =====================================================================
+
+const {
+  GOOGLE_SERVICE_ACCOUNT_B64,
+  GOOGLE_SHEET_ID,
+  GOOGLE_SHEET_TAB = 'Hoja 1',
+  HORA_ETIQUETAS_VENTAS = '09:00',
+} = process.env;
+
+// ---------------------------------------------------------------------
+// Google Sheets
+// ---------------------------------------------------------------------
+
+function credencialesGoogle() {
+  if (!GOOGLE_SERVICE_ACCOUNT_B64) return null;
+  const json = Buffer.from(GOOGLE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8');
+  return JSON.parse(json);
+}
+
+async function clienteSheets() {
+  const credentials = credencialesGoogle();
+  if (!credentials) {
+    throw new Error('Falta la variable de entorno GOOGLE_SERVICE_ACCOUNT_B64 en Render.');
+  }
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  const client = await auth.getClient();
+  return google.sheets({ version: 'v4', auth: client });
+}
+
+// Agrega filas al final de la planilla general, respetando EXACTAMENTE
+// las 14 columnas (A a N) tal como están hoy:
+// ID | Fecha | Nombre | DNI | Teléfono | Dirección(provincia) | Monto |
+// Título de la publicación | Unidades | Envío | Flex $ | Flex # | (vacía) | Venta Publicidad
+//
+// Teléfono, Flex $, Flex # y la columna sin título quedan siempre
+// vacías (según lo charlado: no se cargan por API).
+async function agregarFilasAPlanilla(filas) {
+  if (!filas.length) return;
+  const sheets = await clienteSheets();
+  const values = filas.map((f) => [
+    f.id,
+    f.fecha,
+    f.nombre,
+    f.dni,
+    '', // Teléfono - no disponible vía API
+    f.provincia,
+    f.monto,
+    f.titulo,
+    f.unidades,
+    f.envio,
+    '', // Flex $
+    '', // Flex #
+    '', // columna sin título
+    f.publicidad,
+  ]);
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${GOOGLE_SHEET_TAB}!A:N`,
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values },
+  });
+}
+
+// ---------------------------------------------------------------------
+// Armar una fila de planilla a partir de una orden de Mercado Libre
+// ---------------------------------------------------------------------
+
+async function armarFilaPlanilla(orden, token) {
+  const productos = (orden.order_items || []).map((it) => it.item.title).join('; ');
+  const unidades = (orden.order_items || []).reduce((suma, it) => suma + it.quantity, 0);
+
+  let nombre = orden.buyer?.nickname || '';
+  let dni = '';
+  try {
+    // Datos de facturación (nombre real / DNI), si la cuenta tiene
+    // permiso de "Facturación al comprador". Si falla, seguimos sin
+    // frenar el resto del proceso.
+    const { data: fact } = await axios.get(
+      `https://api.mercadolibre.com/orders/${orden.id}/billing_info`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (fact?.billing_info?.doc_number) dni = fact.billing_info.doc_number;
+    if (fact?.billing_info?.name) {
+      nombre = `${fact.billing_info.name} ${fact.billing_info.last_name || ''}`.trim();
+    }
+  } catch (err) {
+    console.error(`(planilla) No se pudo traer facturación de la orden ${orden.id}:`, err.response?.data || err.message);
+  }
+
+  let provincia = '';
+  if (orden.shipping?.id) {
+    try {
+      const { data: envio } = await axios.get(`https://api.mercadolibre.com/shipments/${orden.shipping.id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      provincia = envio.receiver_address?.state?.name || '';
+    } catch (err) {
+      console.error(`(planilla) No se pudo traer envío de la orden ${orden.id}:`, err.response?.data || err.message);
+    }
+  }
+
+  const tipoEnvio = await obtenerTipoEnvio(token, orden.shipping?.id);
+
+  return {
+    id: orden.id,
+    fecha: new Intl.DateTimeFormat('es-AR', {
+      timeZone: ZONA_HORARIA,
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(orden.date_created)),
+    nombre,
+    dni,
+    provincia,
+    monto: orden.total_amount,
+    titulo: productos,
+    unidades,
+    envio: tipoEnvio,
+    // Mercado Libre no expone de forma confiable si una venta vino de
+    // publicidad; queda vacío a propósito en vez de adivinar.
+    publicidad: '',
+  };
+}
+
+// ---------------------------------------------------------------------
+// Etiquetas: bajar y combinar en un solo PDF
+// ---------------------------------------------------------------------
+
+async function combinarPDFs(buffers) {
+  const pdfFinal = await PDFDocument.create();
+  for (const buf of buffers) {
+    const pdf = await PDFDocument.load(buf);
+    const paginas = await pdfFinal.copyPages(pdf, pdf.getPageIndices());
+    paginas.forEach((p) => pdfFinal.addPage(p));
+  }
+  return Buffer.from(await pdfFinal.save());
+}
+
+async function enviarPDFPorTelegram(chatId, buffer, nombreArchivo, caption) {
+  const form = new FormData();
+  form.append('chat_id', chatId);
+  form.append('caption', caption);
+  form.append('document', buffer, { filename: nombreArchivo, contentType: 'application/pdf' });
+  await axios.post(`${TELEGRAM_API}/sendDocument`, form, { headers: form.getHeaders() });
+}
+
+// ---------------------------------------------------------------------
+// Corrida diaria: recorre las 3 cuentas, arma la planilla y las etiquetas
+// ---------------------------------------------------------------------
+
+async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
+  const hoy = fechaHoyAR();
+  if (!forzar && data.etiquetas_ventas_ultima_fecha === hoy) {
+    return { ok: true, motivo: 'Ya se había corrido hoy.', filas: 0, etiquetas: 0 };
+  }
+
+  const buffersEtiquetas = [];
+  const filasPlanilla = [];
+  let huboError = false;
+
+  for (const cuentaId of Object.keys(data.cuentas || {})) {
+    const cuenta = data.cuentas[cuentaId];
+    if (!cuenta.refresh_token) continue;
+    if (!Array.isArray(cuenta.etiquetas_generadas)) cuenta.etiquetas_generadas = [];
+    if (!Array.isArray(cuenta.filas_planilla_cargadas)) cuenta.filas_planilla_cargadas = [];
+
+    try {
+      const token = await getAccessToken(cuentaId);
+
+      const { data: resp } = await axios.get('https://api.mercadolibre.com/orders/search', {
+        params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 50 },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const ordenesHoy = (resp.results || []).filter((o) => fechaDeAR(o.date_created) === hoy);
+
+      // --- Filas nuevas para la planilla ---
+      for (const orden of ordenesHoy) {
+        if (cuenta.filas_planilla_cargadas.includes(orden.id)) continue;
+        try {
+          const fila = await armarFilaPlanilla(orden, token);
+          filasPlanilla.push(fila);
+          cuenta.filas_planilla_cargadas.push(orden.id);
+        } catch (err) {
+          console.error(`Error armando fila de planilla (orden ${orden.id}):`, err.response?.data || err.message);
+          huboError = true;
+        }
+      }
+
+      // --- Etiquetas nuevas para imprimir ---
+      const shipmentIdsNuevos = ordenesHoy
+        .filter((o) => o.shipping?.id && !cuenta.etiquetas_generadas.includes(o.shipping.id))
+        .map((o) => o.shipping.id);
+
+      for (const grupo of partirEnGrupos(shipmentIdsNuevos, 20)) {
+        try {
+          const resp2 = await axios.get('https://api.mercadolibre.com/shipment_labels', {
+            params: { shipment_ids: grupo.join(','), response_type: 'pdf' },
+            headers: { Authorization: `Bearer ${token}` },
+            responseType: 'arraybuffer',
+          });
+          buffersEtiquetas.push(Buffer.from(resp2.data));
+          grupo.forEach((id) => cuenta.etiquetas_generadas.push(id));
+        } catch (err) {
+          console.error(`Error bajando etiquetas de ${cuenta.nombre}:`, err.response?.data || err.message);
+          huboError = true;
+        }
+      }
+
+      await saveData(data);
+    } catch (err) {
+      console.error(`Error en corrida diaria de ${cuenta.nombre}:`, err.response?.data || err.message);
+      huboError = true;
+    }
+  }
+
+  // Guardar filas en la planilla de Google Sheets
+  if (filasPlanilla.length) {
+    try {
+      await agregarFilasAPlanilla(filasPlanilla);
+    } catch (err) {
+      console.error('Error escribiendo en la planilla de Google Sheets:', err.response?.data || err.message);
+      huboError = true;
+    }
+  }
+
+  // Combinar y mandar las etiquetas por Telegram
+  let pdfEnviado = false;
+  if (buffersEtiquetas.length) {
+    try {
+      const combinado = await combinarPDFs(buffersEtiquetas);
+      await enviarPDFPorTelegram(
+        TELEGRAM_CHAT_ID,
+        combinado,
+        `etiquetas_${hoy}.pdf`,
+        `📦 Etiquetas del ${hoy} — ${filasPlanilla.length} venta(s) cargada(s) en la planilla.`
+      );
+      pdfEnviado = true;
+    } catch (err) {
+      console.error('Error combinando/mandando el PDF de etiquetas:', err.response?.data || err.message);
+      huboError = true;
+    }
+  } else if (!forzar) {
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: `📦 No hay etiquetas nuevas para imprimir hoy (${hoy}).`,
+    });
+  }
+
+  if (!huboError) data.etiquetas_ventas_ultima_fecha = hoy;
+  await saveData(data);
+
+  return { ok: !huboError, filas: filasPlanilla.length, etiquetas: buffersEtiquetas.length, pdfEnviado };
+}
+
+// Se llama cada 1 minuto (enganchado desde revisarTodo). Solo actúa
+// una vez que pasó la hora configurada, y una sola vez por día.
+async function revisarEtiquetasYVentas() {
+  if (horaAhoraAR() < HORA_ETIQUETAS_VENTAS) return;
+  try {
+    const resultado = await corridaDiariaEtiquetasYVentas();
+    if (resultado.motivo) return; // ya se había corrido hoy, no hay nada que loguear
+    console.log(`📦🧾 Corrida diaria de etiquetas/ventas:`, resultado);
+  } catch (err) {
+    console.error('Error en revisarEtiquetasYVentas:', err.response?.data || err.message);
+  }
+}
+
+// ---------------------------------------------------------------------
+// Rutas de diagnóstico (etiquetas + planilla)
+// ---------------------------------------------------------------------
+
+// Corre todo el proceso ahora mismo (sin esperar a la hora configurada
+// ni al chequeo de "ya corrió hoy").
+app.get('/debug/run-etiquetas-ventas', async (req, res) => {
+  try {
+    const resultado = await corridaDiariaEtiquetasYVentas({ forzar: true });
+    res.json(resultado);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Prueba solo el acceso a la planilla, escribiendo una fila de prueba.
+app.get('/debug/test-sheet', async (req, res) => {
+  try {
+    await agregarFilasAPlanilla([
+      {
+        id: 'TEST',
+        fecha: new Intl.DateTimeFormat('es-AR', { timeZone: ZONA_HORARIA, dateStyle: 'short', timeStyle: 'short' }).format(new Date()),
+        nombre: 'Prueba',
+        dni: '',
+        provincia: 'Buenos Aires',
+        monto: 1000,
+        titulo: 'Producto de prueba',
+        unidades: 1,
+        envio: 'Flex',
+        publicidad: '',
+      },
+    ]);
+    res.json({ ok: true, mensaje: 'Se agregó una fila de prueba a la planilla. Revisala y despues borrala a mano.' });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
 
 async function start() {
   data = await loadData();
