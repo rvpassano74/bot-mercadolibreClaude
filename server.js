@@ -608,7 +608,7 @@ function armarTextoResumenPeriodo(resumen) {
       })
     : ['Sin ventas en las últimas 24hs.'];
 
-  let textoEnvios = `🚚 Envíos: ${resumen.flex} Flex / ${resumen.normal} Normal`;
+  let textoEnvios = `🚚 Envíos (todas las cuentas): ${resumen.flex} Flex / ${resumen.normal} Normal`;
   if (resumen.otros > 0) textoEnvios += ` / ${resumen.otros} otros`;
 
   return (
