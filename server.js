@@ -436,8 +436,8 @@ async function revisarReclamosNuevos() {
 
     try {
       const token = await getAccessToken(cuentaId);
-      const response = await axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
-        params: { 'players.role': 'respondent', 'players.user_id': cuentaId, sort: 'date_created:desc' },
+      const response = await axios.get('https://api.mercadolibre.com/marketplace/v2/claims/search', {
+        params: { user_id: cuentaId, sort: 'last_updated:desc' },
         headers: { Authorization: `Bearer ${token}` },
       });
 
@@ -710,8 +710,8 @@ app.get('/debug/list-claims', async (req, res) => {
   if (error) return res.status(400).json({ error });
   try {
     const token = await getAccessToken(cuentaId);
-    const response = await axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
-      params: { 'players.role': 'respondent', 'players.user_id': cuentaId, sort: 'date_created:desc' },
+    const response = await axios.get('https://api.mercadolibre.com/marketplace/v2/claims/search', {
+      params: { user_id: cuentaId, sort: 'last_updated:desc' },
       headers: { Authorization: `Bearer ${token}` },
     });
     const reclamos = (response.data.data || []).map((r) => ({
