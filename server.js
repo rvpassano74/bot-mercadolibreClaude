@@ -62,6 +62,7 @@ function datosVacios() {
     pending: {},
     resumen_periodo: { totales: {}, flex: 0, normal: 0, otros: 0 },
     resumen_ultima_fecha_enviada: null,
+    ventas_por_dia: {}, // { "2026-09-21": 45000, ... } - todas las cuentas juntas
   };
 }
 
@@ -69,6 +70,72 @@ const ZONA_HORARIA = 'America/Argentina/Buenos_Aires';
 
 function fechaHoyAR() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: ZONA_HORARIA }).format(new Date()); // "YYYY-MM-DD"
+}
+
+function nombreMes(mesStr) {
+  if (!mesStr) return '';
+  const [year, month] = mesStr.split('-');
+  const fecha = new Date(Date.UTC(Number(year), Number(month) - 1, 1));
+  return new Intl.DateTimeFormat('es-AR', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(fecha);
+}
+
+// Convierte una fecha (la de creación de la orden, en formato ISO) a
+// su día calendario en horario argentino, tipo "2026-09-21".
+function fechaDeAR(fechaISO) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: ZONA_HORARIA }).format(new Date(fechaISO));
+}
+
+// Suma una venta al total de SU día (el día en que se generó la
+// orden), para poder después armar comparaciones "mes a la fecha".
+function agregarVentaPorDia(fechaISO, monto) {
+  if (!data.ventas_por_dia) data.ventas_por_dia = {};
+  const dia = fechaDeAR(fechaISO);
+  data.ventas_por_dia[dia] = (data.ventas_por_dia[dia] || 0) + monto;
+  limpiarVentasPorDiaViejas();
+}
+
+// No hace falta guardar más de ~65 días (nos alcanza para comparar el
+// mes actual contra el anterior), así que vamos borrando lo más viejo.
+function limpiarVentasPorDiaViejas() {
+  const limite = new Date();
+  limite.setDate(limite.getDate() - 65);
+  const limiteStr = new Intl.DateTimeFormat('en-CA', { timeZone: ZONA_HORARIA }).format(limite);
+  for (const dia of Object.keys(data.ventas_por_dia)) {
+    if (dia < limiteStr) delete data.ventas_por_dia[dia];
+  }
+}
+
+// Suma las ventas del día 1 hasta "hoy" (o hasta el mismo número de
+// día, si se pide un mes anterior) de un mes dado. offsetMeses: 0 =
+// este mes, -1 = el mes anterior, a la misma altura.
+function acumuladoMesHastaHoy(offsetMeses) {
+  const partesHoy = new Intl.DateTimeFormat('en-CA', {
+    timeZone: ZONA_HORARIA,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const anioHoy = Number(partesHoy.find((p) => p.type === 'year').value);
+  const mesHoy = Number(partesHoy.find((p) => p.type === 'month').value); // 1-12
+  const diaHoy = Number(partesHoy.find((p) => p.type === 'day').value);
+
+  let mesObjetivo = mesHoy + offsetMeses;
+  let anioObjetivo = anioHoy;
+  if (mesObjetivo < 1) {
+    mesObjetivo += 12;
+    anioObjetivo -= 1;
+  }
+
+  const ultimoDiaDelMes = new Date(Date.UTC(anioObjetivo, mesObjetivo, 0)).getUTCDate();
+  const diaTope = Math.min(diaHoy, ultimoDiaDelMes); // por si el mes anterior tiene menos días (ej: febrero)
+
+  let total = 0;
+  for (let d = 1; d <= diaTope; d++) {
+    const diaStr = `${anioObjetivo}-${String(mesObjetivo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    total += (data.ventas_por_dia && data.ventas_por_dia[diaStr]) || 0;
+  }
+
+  return { total, mes: `${anioObjetivo}-${String(mesObjetivo).padStart(2, '0')}`, diaTope };
 }
 
 function horaAhoraAR() {
@@ -451,6 +518,8 @@ async function revisarVentasNuevas() {
         else if (tipoEnvio === 'Normal') data.resumen_periodo.normal++;
         else data.resumen_periodo.otros++;
 
+        agregarVentaPorDia(orden.date_created, Number(orden.total_amount));
+
         cuenta.ventas_notificadas.push(orden.id);
       }
 
@@ -615,8 +684,28 @@ function armarTextoResumenPeriodo(resumen) {
     `📊 Resumen de ventas (últimas 24hs, corte ${HORA_DE_CORTE})\n\n` +
     `${lineas.join('\n')}\n\n` +
     `💰 Total combinado: ${formatearMoneda(totalCombinado, 'ARS')}\n` +
-    (totalVentas > 0 ? textoEnvios : '')
+    (totalVentas > 0 ? textoEnvios + '\n\n' : '\n') +
+    textoComparativaMensual()
   );
+}
+
+// Texto con "cuánto llevo facturado este mes hasta hoy" comparado con
+// "cuánto llevaba facturado a la misma altura el mes pasado" (todas
+// las cuentas juntas).
+function textoComparativaMensual() {
+  const actual = acumuladoMesHastaHoy(0);
+  const anterior = acumuladoMesHastaHoy(-1);
+
+  let texto = `📅 ${nombreMes(actual.mes)}, acumulado al día ${actual.diaTope}: ${formatearMoneda(actual.total, 'ARS')}`;
+  texto += `\n📈 ${nombreMes(anterior.mes)} a la misma altura (día ${anterior.diaTope}): ${formatearMoneda(anterior.total, 'ARS')}`;
+
+  if (anterior.total > 0) {
+    const variacion = ((actual.total - anterior.total) / anterior.total) * 100;
+    const signo = variacion >= 0 ? '+' : '';
+    texto += `\n${variacion >= 0 ? '🟢' : '🔴'} ${signo}${variacion.toFixed(1)}% respecto al mes anterior a esta altura`;
+  }
+
+  return texto;
 }
 
 async function revisarResumenDiario() {
@@ -798,6 +887,7 @@ app.get('/debug/simulate-order', async (req, res) => {
     if (tipoEnvio === 'Flex') data.resumen_periodo.flex++;
     else if (tipoEnvio === 'Normal') data.resumen_periodo.normal++;
     else data.resumen_periodo.otros++;
+    agregarVentaPorDia(orden.date_created, Number(orden.total_amount));
     await saveData(data);
 
     res.json({ ok: true, tipoEnvio });
@@ -845,6 +935,20 @@ app.get('/debug/test-resumen-diario', async (req, res) => {
   const texto = armarTextoResumenPeriodo(data.resumen_periodo || resumenPeriodoVacio());
   await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID_RESUMEN, text: `${texto}\n\n(prueba manual, no reinicia el acumulado)` });
   res.json({ ok: true });
+});
+
+// Muestra el acumulado del mes en curso a la fecha, y el del mes
+// anterior a la misma altura.
+app.get('/debug/mes-actual', (req, res) => {
+  res.json({
+    este_mes_a_la_fecha: acumuladoMesHastaHoy(0),
+    mes_anterior_a_la_misma_fecha: acumuladoMesHastaHoy(-1),
+  });
+});
+
+// Muestra el detalle día por día que el bot tiene guardado.
+app.get('/debug/ventas-por-dia', (req, res) => {
+  res.json(data.ventas_por_dia || {});
 });
 
 app.get('/debug/list-claims', async (req, res) => {
