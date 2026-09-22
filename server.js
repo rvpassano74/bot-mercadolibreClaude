@@ -2184,6 +2184,73 @@ app.get('/debug/item-detalle', async (req, res) => {
   }
 });
 
+// Trae el detalle de FACTURACIÓN/COSTOS real de una orden puntual,
+// usando el endpoint oficial de Mercado Libre pensado justo para esto
+// (no el de /orders). Es el mismo dato de fondo que arma el reporte
+// "Ventas AR" que se descarga desde el panel de vendedor (columna
+// "Total (ARS)"): cargo por venta, costo fijo, envío, impuestos,
+// descuentos, etc. Se usa para confirmar/ajustar obtenerMontoNeto().
+app.get('/debug/orden-billing', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const { orden } = req.query;
+  if (!orden) return res.status(400).json({ error: 'Falta el parámetro ?orden=ID_DE_LA_ORDEN' });
+  try {
+    const token = await getAccessToken(cuentaId);
+    const { data: detalle } = await axios.get('https://api.mercadolibre.com/billing/integration/group/ML/order/details', {
+      params: { order_ids: orden, seller_id: cuentaId },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    res.json(detalle);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Lista las últimas ventas pagadas de una cuenta con TODOS los IDs
+// relacionados (order_id, pack_id, shipping_id) para poder comparar
+// contra el "# de venta" que muestra el reporte "Ventas AR" de
+// Mercado Libre y averiguar cuál de estos IDs es el que corresponde.
+// De paso, prueba el llamado a billing_info (nombre real de
+// facturación) para cada una y muestra si funciona o si falla (y por
+// qué), para diagnosticar por qué seguían apareciendo nicknames.
+app.get('/debug/ordenes-recientes', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  try {
+    const token = await getAccessToken(cuentaId);
+    const { data: resp } = await axios.get('https://api.mercadolibre.com/orders/search', {
+      params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 15 },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const resultado = [];
+    for (const orden of resp.results || []) {
+      let billingInfo = null;
+      let errorBilling = null;
+      try {
+        const { data: fact } = await axios.get(`https://api.mercadolibre.com/orders/${orden.id}/billing_info`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        billingInfo = fact?.billing_info || fact;
+      } catch (err) {
+        errorBilling = err.response?.data || err.message;
+      }
+      resultado.push({
+        order_id: orden.id,
+        pack_id: orden.pack_id || null,
+        shipping_id: orden.shipping?.id || null,
+        fecha: orden.date_created,
+        nickname_comprador: orden.buyer?.nickname || null,
+        billing_info: billingInfo,
+        error_billing_info: errorBilling,
+      });
+    }
+    res.json({ cantidad: resultado.length, ordenes: resultado });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 // Trae el detalle COMPLETO (sin filtrar campos) de una orden puntual,
 // con foco en orden.payments[] - sirve para confirmar, contra una
 // venta real, en qué campo viene exactamente el monto NETO que
