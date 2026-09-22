@@ -1352,10 +1352,33 @@ function resolverProductosOrden(orden) {
 // (el descuento de envío que ML le regaló al comprador y que se le
 // compensa al vendedor). Por eso se sigue esa fuente para este
 // componente.
+// Mercado Libre le pone un límite bastante bajo a estos endpoints de
+// facturación (se confirmó viendo un 429 real: "Rate limit exceeded: 5
+// requests per minute"). Al procesar muchas ventas seguidas sin pausa
+// (ej: /debug/test-excel-ventas con 46 ventas de las 3 cuentas) la
+// mayoría terminaba pisando ese límite y cayendo al fallback
+// (exacto:false), aunque el cálculo en sí esté bien - se confirmó
+// pidiendo una de esas mismas órdenes sola, que anduvo perfecto. Este
+// helper reintenta con espera creciente cuando la respuesta es 429,
+// en vez de rendirse en el primer intento.
+async function axiosGetConReintento(url, config, intentos = 4) {
+  for (let intento = 0; intento < intentos; intento++) {
+    try {
+      return await axios.get(url, config);
+    } catch (err) {
+      const esRateLimit = err.response?.status === 429;
+      if (!esRateLimit || intento === intentos - 1) throw err;
+      const esperaHeader = Number(err.response?.headers?.['retry-after']);
+      const espera = esperaHeader > 0 ? esperaHeader * 1000 : 1500 * Math.pow(2, intento);
+      await new Promise((r) => setTimeout(r, espera));
+    }
+  }
+}
+
 async function obtenerBonificacionEnvio(shippingId, token) {
   if (!shippingId) return 0;
   try {
-    const { data: costos } = await axios.get(`https://api.mercadolibre.com/shipments/${shippingId}/costs`, {
+    const { data: costos } = await axiosGetConReintento(`https://api.mercadolibre.com/shipments/${shippingId}/costs`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     const descuentos = costos?.receiver?.discounts || [];
@@ -1371,7 +1394,7 @@ async function obtenerBonificacionEnvio(shippingId, token) {
 
 async function obtenerMontoNeto(cuentaId, orden, token) {
   try {
-    const { data: billing } = await axios.get(
+    const { data: billing } = await axiosGetConReintento(
       'https://api.mercadolibre.com/billing/integration/group/ML/order/details',
       { params: { order_ids: orden.id, seller_id: cuentaId }, headers: { Authorization: `Bearer ${token}` } }
     );
@@ -1892,6 +1915,10 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
       if (EXPORT_VENTAS_ACTIVA) {
         for (const orden of ordenesPendientes) {
           if (cuenta.filas_export_cargadas.includes(orden.id)) continue;
+          // Pausa chica entre ventas para no pisar el límite de la API
+          // de facturación de Mercado Libre (ver comentario en
+          // axiosGetConReintento).
+          await new Promise((r) => setTimeout(r, 400));
           try {
             const filaML = await armarFilaVentaML(cuentaId, orden, token);
             const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
@@ -2123,6 +2150,10 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
       const cuentaNombre = cuenta.nombre || cuentaId;
 
       for (const orden of ordenesPendientes) {
+        // Pausa chica entre ventas para no pisar el límite de la API
+        // de facturación de Mercado Libre (ver comentario en
+        // axiosGetConReintento).
+        await new Promise((r) => setTimeout(r, 400));
         const filaML = await armarFilaVentaML(cuentaId, orden, token);
         const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
 
