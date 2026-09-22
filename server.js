@@ -1354,6 +1354,24 @@ function obtenerMontoNeto(orden) {
   return { monto: suma, exacto: true };
 }
 
+// El nombre real de facturación NO viene en un campo plano
+// (billing_info.name / billing_info.last_name, que es lo que se
+// había asumido antes) - viene adentro de un array
+// "additional_info": [{type: 'FIRST_NAME', value: '...'}, {type:
+// 'LAST_NAME', value: '...'}, ...] (o BUSINESS_NAME para facturación
+// a empresa/CUIT). Esto se confirmó con datos reales via
+// /debug/ordenes-recientes - antes de este fix, esa condición nunca
+// se cumplía y por eso siempre quedaba el nickname.
+function extraerNombreFacturacion(billingInfo) {
+  const info = {};
+  for (const item of billingInfo?.additional_info || []) {
+    if (item?.type && item.value !== undefined && item.value !== null) info[item.type] = item.value;
+  }
+  if (info.BUSINESS_NAME) return info.BUSINESS_NAME;
+  const nombre = [info.FIRST_NAME, info.LAST_NAME].filter(Boolean).join(' ').trim();
+  return nombre || null;
+}
+
 // Igual que armarFilaPlanilla, pero para el export a Excel (feature
 // aparte, no toca la planilla de Google Sheets). Trae el nombre y DNI
 // reales de facturación (no el nickname de usuario de Mercado Libre) y
@@ -1370,9 +1388,8 @@ async function armarFilaVentaML(orden, token) {
       { headers: { Authorization: `Bearer ${token}` } }
     );
     if (fact?.billing_info?.doc_number) dni = fact.billing_info.doc_number;
-    if (fact?.billing_info?.name) {
-      nombre = `${fact.billing_info.name} ${fact.billing_info.last_name || ''}`.trim();
-    }
+    const nombreReal = extraerNombreFacturacion(fact?.billing_info);
+    if (nombreReal) nombre = nombreReal;
   } catch (err) {
     console.error(`(export) No se pudo traer facturación de la orden ${orden.id}:`, err.response?.data || err.message);
   }
@@ -1394,6 +1411,16 @@ async function armarFilaVentaML(orden, token) {
 
   return {
     id: orden.id,
+    // El "# de venta" que Mercado Libre te muestra en el panel y en el
+    // reporte "Ventas AR" que bajás vos es el pack_id, NO el order_id
+    // (confirmado con datos reales: pack_id 2000015149351417 = tu "#
+    // de venta" de esa fila). Cuando una venta no forma parte de un
+    // paquete de varios productos no tiene pack_id, y ahí sí se usa el
+    // order_id. OJO: si una compra se dividió en 2+ "órdenes" dentro
+    // de un mismo paquete, te va a aparecer el mismo número repetido
+    // en 2 filas (cada una con sus propios productos) - así como
+    // Mercado Libre las junta en 1 sola fila en su reporte.
+    numeroVenta: orden.pack_id || orden.id,
     fechaHora: new Date(orden.date_created),
     nombre,
     dni,
@@ -1616,7 +1643,7 @@ async function crearExcelVentas(filasML, filasVentas, filasRevisar) {
   estilarEncabezado(hojaML.getRow(1), 'FF1F3864');
   for (const f of filasML) {
     hojaML.addRow({
-      id: String(f.id),
+      id: String(f.numeroVenta ?? f.id),
       fecha: f.fechaHora,
       nombre: f.nombre,
       dni: f.dni,
@@ -1794,7 +1821,7 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
             });
             if (manual || filaML.montoExacto === false) {
               filasRevisar.push({
-                id: orden.id,
+                id: filaML.numeroVenta,
                 cuenta: cuentaNombre,
                 fechaHora: filaML.fechaHora,
                 monto: filaML.monto,
@@ -2023,7 +2050,7 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
         });
         if (manual || filaML.montoExacto === false) {
           filasRevisar.push({
-            id: orden.id,
+            id: filaML.numeroVenta,
             cuenta: cuentaNombre,
             fechaHora: filaML.fechaHora,
             monto: filaML.monto,
