@@ -67,6 +67,15 @@ function datosVacios() {
     resumen_periodo: { totales: {}, flex: 0, normal: 0, otros: 0 },
     resumen_ultima_fecha_enviada: null,
     ventas_por_dia: {}, // { "2026-09-21": 45000, ... } - todas las cuentas juntas
+    // Datos sacados directamente del Excel "Ventas AR" que Raul baja a
+    // mano desde Mercado Libre (botón "Descargar Excel de ventas" en
+    // la sección Ventas) y le manda al bot por Telegram. Mercado Libre
+    // ya calcula ahí el monto final y si fue venta por publicidad, así
+    // que en vez de tratar de recalcularlos por API (lento, con rate
+    // limit, y con margen de error) el bot usa estos valores cuando
+    // están disponibles. Clave = "# de venta" (pack_id), que es único
+    // en toda Mercado Libre, no hace falta separar por cuenta.
+    reporte_ventas_ml: {}, // { "2000015141422323": { monto, publicidad, cargadoFecha } }
   };
 }
 
@@ -186,6 +195,7 @@ async function loadData() {
     const res = await axios.get(`${UPSTASH_REDIS_REST_URL}/get/botdata`, { headers: upstashHeaders });
     if (!res.data.result) return datosVacios();
     const migrado = migrarSiHaceFalta(JSON.parse(res.data.result));
+    if (!migrado.reporte_ventas_ml) migrado.reporte_ventas_ml = {}; // datos guardados antes de este campo
     return migrado;
   } catch (err) {
     console.error('Error leyendo memoria del bot:', err.response?.data || err.message);
@@ -745,7 +755,39 @@ app.post('/telegram/webhook', async (req, res) => {
   res.sendStatus(200);
 
   const message = req.body.message;
-  if (!message || !message.reply_to_message || !message.text) return;
+  if (!message) return;
+
+  // Si mandás por Telegram el Excel "Ventas AR" que bajás de Mercado
+  // Libre (Ventas > "Descargar Excel de ventas"), el bot lo lee y
+  // guarda el monto y "Venta por publicidad" de cada venta que
+  // aparezca ahí, para usarlos en el próximo export en vez de
+  // recalcularlos por API.
+  if (message.document) {
+    const nombreArchivo = message.document.file_name || 'archivo';
+    try {
+      const { data: fileInfo } = await axios.get(`${TELEGRAM_API}/getFile`, {
+        params: { file_id: message.document.file_id },
+      });
+      const filePath = fileInfo.result.file_path;
+      const respuestaArchivo = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`, {
+        responseType: 'arraybuffer',
+      });
+      const resultado = await cargarReporteVentasML(Buffer.from(respuestaArchivo.data));
+      await axios.post(`${TELEGRAM_API}/sendMessage`, {
+        chat_id: message.chat.id,
+        text: `📊 Leí "${nombreArchivo}" y cargué ${resultado.cantidad} venta(s). El próximo Excel de ventas va a usar estos montos (los mismos que calcula Mercado Libre) para esas ventas.`,
+      });
+    } catch (err) {
+      console.error('Error procesando reporte de ventas subido:', err.response?.data || err.message);
+      await axios.post(`${TELEGRAM_API}/sendMessage`, {
+        chat_id: message.chat.id,
+        text: `❌ No pude leer "${nombreArchivo}" como reporte de ventas de Mercado Libre (${err.message}). ¿Es el Excel de "Descargar Excel de ventas"?`,
+      });
+    }
+    return;
+  }
+
+  if (!message.reply_to_message || !message.text) return;
 
   const repliedId = message.reply_to_message.message_id;
   const pendiente = data.pending[repliedId];
@@ -1499,6 +1541,114 @@ function extraerNombreFacturacion(billingInfo) {
   return nombre || null;
 }
 
+// Lee el Excel "Ventas AR" que Raul baja a mano desde Mercado Libre
+// (Ventas > "Descargar Excel de ventas") y manda al bot por Telegram,
+// y carga en data.reporte_ventas_ml el "Total (ARS)" y "Venta por
+// publicidad" de cada venta que aparezca ahí, ya calculados por
+// Mercado Libre. Busca la fila de encabezados buscando la celda "# de
+// venta" (en vez de asumir un número de fila fijo, porque el archivo
+// trae unas filas de avisos arriba que pueden variar) y arma un mapa
+// de columna por nombre de encabezado (quedándose con la PRIMERA
+// aparición de cada nombre, porque el archivo repite algunos
+// encabezados como "Estado" o "Unidades" más adelante para otras
+// secciones).
+// ExcelJS no siempre da el valor de una celda como texto plano: la
+// columna "# de venta" viene como un link ({text, hyperlink}), y
+// alguna celda de texto puede venir como {richText:[...]}. Este
+// helper normaliza cualquiera de esos casos a un string.
+function textoCelda(cell) {
+  const v = cell.value;
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'object') {
+    if (v.text !== undefined) return String(v.text).trim();
+    if (v.result !== undefined) return String(v.result).trim();
+    if (Array.isArray(v.richText)) return v.richText.map((p) => p.text).join('').trim();
+  }
+  return String(v).trim();
+}
+
+// Cuando una compra de varios productos se divide en varias "órdenes"
+// (se ve en el Excel como varias filas para la misma venta), Mercado
+// Libre muestra en el TEXTO de cada fila el order_id individual (no
+// el "# de venta" real), pero el LINK de esa celda sigue apuntando al
+// detalle de la venta con el pack_id real - por eso acá se prioriza
+// sacar el número del link, así todas las filas de una misma venta
+// dividida quedan agrupadas bajo el mismo número (el que también usa
+// el bot internamente como numeroVenta).
+function numeroVentaCelda(cell) {
+  const v = cell.value;
+  if (v && typeof v === 'object' && v.hyperlink) {
+    const m = String(v.hyperlink).match(/\/ventas\/(\d+)\//);
+    if (m) return m[1];
+  }
+  return textoCelda(cell);
+}
+
+async function cargarReporteVentasML(buffer) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  const ws = wb.worksheets[0];
+  if (!ws) throw new Error('El archivo no tiene ninguna hoja.');
+
+  let filaEncabezado = null;
+  for (let r = 1; r <= Math.min(20, ws.rowCount); r++) {
+    if (textoCelda(ws.getCell(r, 1)) === '# de venta') {
+      filaEncabezado = r;
+      break;
+    }
+  }
+  if (!filaEncabezado) {
+    throw new Error('No encontré la columna "# de venta" en las primeras filas - ¿es el Excel de "Descargar Excel de ventas" de Mercado Libre?');
+  }
+
+  const columnas = {};
+  ws.getRow(filaEncabezado).eachCell((cell, col) => {
+    const texto = textoCelda(cell);
+    if (texto && !(texto in columnas)) columnas[texto] = col;
+  });
+
+  const colVenta = columnas['# de venta'];
+  const colTotal = columnas['Total (ARS)'];
+  const colPublicidad = columnas['Venta por publicidad'];
+  if (!colVenta || !colTotal) {
+    throw new Error('No encontré las columnas "# de venta" / "Total (ARS)" esperadas en ese archivo.');
+  }
+
+  // Cuando una venta se dividió en varias filas (ver numeroVentaCelda
+  // arriba), el monto final SOLO aparece completo en UNA de esas
+  // filas (las demás quedan con "Total (ARS)" vacío/0, pero pueden
+  // traer su propio "Venta por publicidad": Sí para ese producto en
+  // particular). Por eso se arma primero un mapa combinando todas las
+  // filas de cada venta, en vez de simplemente pisar con la última
+  // fila leída (que podría ser una de las filas "vacías" y borrar el
+  // monto bueno que ya se había leído).
+  const combinado = {};
+  for (let r = filaEncabezado + 1; r <= ws.rowCount; r++) {
+    const numeroVenta = numeroVentaCelda(ws.getCell(r, colVenta));
+    if (!numeroVenta) continue;
+    const montoCelda = ws.getCell(r, colTotal).value;
+    const montoNum = Number(typeof montoCelda === 'object' ? montoCelda?.result : montoCelda);
+    const publicidadRaw = colPublicidad ? textoCelda(ws.getCell(r, colPublicidad)) : '';
+
+    const previo = combinado[numeroVenta] || { monto: null, publicidad: '' };
+    combinado[numeroVenta] = {
+      monto: Number.isFinite(montoNum) && montoNum !== 0 ? montoNum : previo.monto,
+      publicidad: publicidadRaw === 'Sí' ? 'Sí' : previo.publicidad,
+    };
+  }
+
+  let cantidad = 0;
+  const ahora = new Date().toISOString();
+  for (const numeroVenta of Object.keys(combinado)) {
+    const { monto, publicidad } = combinado[numeroVenta];
+    if (monto === null) continue; // esta venta todavía no tiene el monto final en Mercado Libre - se sigue calculando por API
+    data.reporte_ventas_ml[numeroVenta] = { monto, publicidad, cargadoFecha: ahora };
+    cantidad++;
+  }
+  await saveData(data);
+  return { cantidad };
+}
+
 // Igual que armarFilaPlanilla, pero para el export a Excel (feature
 // aparte, no toca la planilla de Google Sheets). Trae el nombre y DNI
 // reales de facturación (no el nickname de usuario de Mercado Libre) y
@@ -1534,31 +1684,134 @@ async function armarFilaVentaML(cuentaId, orden, token) {
   }
 
   const tipoEnvio = await obtenerTipoEnvio(token, orden.shipping?.id);
-  const { monto, exacto } = await obtenerMontoNeto(cuentaId, orden, token);
+
+  // El "# de venta" que Mercado Libre te muestra en el panel y en el
+  // reporte "Ventas AR" que bajás vos es el pack_id, NO el order_id
+  // (confirmado con datos reales: pack_id 2000015149351417 = tu "#
+  // de venta" de esa fila). Cuando una venta no forma parte de un
+  // paquete de varios productos no tiene pack_id, y ahí sí se usa el
+  // order_id. OJO: si una compra se dividió en 2+ "órdenes" dentro
+  // de un mismo paquete, te va a aparecer el mismo número repetido
+  // en 2 filas (cada una con sus propios productos) - así como
+  // Mercado Libre las junta en 1 sola fila en su reporte.
+  const numeroVenta = orden.pack_id || orden.id;
+
+  // Si Raul ya subió (por Telegram) el Excel "Ventas AR" oficial que
+  // se baja desde Mercado Libre y esta venta figura ahí, se usa ESE
+  // monto y esa "Venta por publicidad" directamente - son los mismos
+  // números que calcula Mercado Libre, así que son la única fuente
+  // 100% confiable. Si la venta todavía no está en ningún reporte
+  // subido, se cae al cálculo por API de siempre - pero OJO: ese
+  // cálculo es una ESTIMACIÓN, no un valor exacto. Se probó a fondo y
+  // Mercado Libre aplica ajustes caso a caso (cargo por vender, costo
+  // fijo, bonificación de envío, costo de envío Flex a cargo del
+  // vendedor, percepciones por provincia...) que no siempre están
+  // todos disponibles/documentados vía API, así que por más que la
+  // llamada a la API salga bien, el número puede no cerrar exacto.
+  // Por eso `exacto` acá SIEMPRE da false salvo que venga del reporte
+  // oficial - así esta fila cae en "Revisar a mano" y Raul la
+  // chequea antes de pasarla a su planilla, en vez de confiar
+  // ciegamente en el cálculo.
+  const delReporteOficial = data.reporte_ventas_ml[String(numeroVenta)];
+  let monto;
+  let exacto;
+  let publicidad;
+  let fuenteMonto;
+  if (delReporteOficial) {
+    monto = delReporteOficial.monto;
+    exacto = true;
+    publicidad = delReporteOficial.publicidad || '';
+    // "reporte": el monto ya es el TOTAL de toda la venta (Mercado
+    // Libre lo da una sola vez por # de venta), a diferencia de
+    // "api" donde cada orden trae su propia porción del total. Esto
+    // importa al agrupar varias órdenes de una misma venta en una
+    // sola fila (ver combinarFilasPorVenta): si viene de "reporte" NO
+    // hay que sumarlo entre las órdenes del grupo, si viene de "api"
+    // sí.
+    fuenteMonto = 'reporte';
+  } else {
+    const resultado = await obtenerMontoNeto(cuentaId, orden, token);
+    monto = resultado.monto;
+    exacto = false; // estimación por API, siempre a revisar (ver comentario arriba)
+    publicidad = '';
+    fuenteMonto = 'api';
+  }
 
   return {
     id: orden.id,
-    // El "# de venta" que Mercado Libre te muestra en el panel y en el
-    // reporte "Ventas AR" que bajás vos es el pack_id, NO el order_id
-    // (confirmado con datos reales: pack_id 2000015149351417 = tu "#
-    // de venta" de esa fila). Cuando una venta no forma parte de un
-    // paquete de varios productos no tiene pack_id, y ahí sí se usa el
-    // order_id. OJO: si una compra se dividió en 2+ "órdenes" dentro
-    // de un mismo paquete, te va a aparecer el mismo número repetido
-    // en 2 filas (cada una con sus propios productos) - así como
-    // Mercado Libre las junta en 1 sola fila en su reporte.
-    numeroVenta: orden.pack_id || orden.id,
+    numeroVenta,
     fechaHora: fechaExcelAR(orden.date_created),
     nombre,
     dni,
     provincia,
     monto,
     montoExacto: exacto,
+    fuenteMonto,
     titulo: productos,
     unidades,
     envio: tipoEnvio,
-    publicidad: '',
+    publicidad,
   };
+}
+
+// Cuando una compra de varios productos se divide en más de una
+// "orden" del lado de Mercado Libre (mismo "# de venta"/pack_id, pero
+// varios order_id), esto junta todas esas filas en UNA sola por
+// venta - que es como Raul la ve y la quiere pasar a su planilla, en
+// vez de que le aparezcan 2 o 3 filas separadas para la misma compra.
+// Recibe un array de { filaML, unidadesPorColumna, manual,
+// itemsSinResolver } (uno por cada orden ya procesada con
+// armarFilaVentaML + resolverProductosOrden) y devuelve un array ya
+// agrupado por numeroVenta.
+function combinarFilasPorVenta(items) {
+  const grupos = new Map();
+  for (const item of items) {
+    const clave = String(item.filaML.numeroVenta);
+    if (!grupos.has(clave)) grupos.set(clave, []);
+    grupos.get(clave).push(item);
+  }
+
+  const combinadas = [];
+  for (const grupo of grupos.values()) {
+    if (grupo.length === 1) {
+      combinadas.push(grupo[0]);
+      continue;
+    }
+
+    const base = grupo[0].filaML;
+    // Si CUALQUIERA de las órdenes de esta venta trajo el monto del
+    // reporte oficial, se usa ESE (una sola vez, no se suma - ver
+    // comentario en fuenteMonto más arriba). Si ninguna lo tiene, se
+    // suman las estimaciones por API de cada orden (cada una es una
+    // porción real del total).
+    const conReporte = grupo.find((it) => it.filaML.fuenteMonto === 'reporte');
+    const monto = conReporte
+      ? conReporte.filaML.monto
+      : grupo.reduce((suma, it) => suma + (Number(it.filaML.monto) || 0), 0);
+    const montoExacto = grupo.every((it) => it.filaML.montoExacto === true);
+    const publicidad = grupo.some((it) => it.filaML.publicidad === 'Sí') ? 'Sí' : '';
+    const titulo = grupo.map((it) => it.filaML.titulo).filter(Boolean).join('; ');
+    const unidades = grupo.reduce((suma, it) => suma + (Number(it.filaML.unidades) || 0), 0);
+
+    const unidadesPorColumna = {};
+    let manual = false;
+    let itemsSinResolver = [];
+    for (const it of grupo) {
+      if (it.manual) manual = true;
+      if (it.itemsSinResolver?.length) itemsSinResolver = itemsSinResolver.concat(it.itemsSinResolver);
+      for (const [columna, cantidad] of Object.entries(it.unidadesPorColumna || {})) {
+        unidadesPorColumna[columna] = (unidadesPorColumna[columna] || 0) + cantidad;
+      }
+    }
+
+    combinadas.push({
+      filaML: { ...base, monto, montoExacto, publicidad, titulo, unidades },
+      unidadesPorColumna,
+      manual,
+      itemsSinResolver,
+    });
+  }
+  return combinadas;
 }
 
 // Ventas de hasta VENTANA_DIAS días atrás (para agarrar las que
@@ -1940,6 +2193,7 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
       // quedan pendientes y se reintentan solas en la corrida
       // siguiente.
       if (EXPORT_VENTAS_ACTIVA) {
+        const itemsCuenta = [];
         for (const orden of ordenesPendientes) {
           if (cuenta.filas_export_cargadas.includes(orden.id)) continue;
           // Pausa chica entre ventas para no pisar el límite de la API
@@ -1949,29 +2203,35 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
           try {
             const filaML = await armarFilaVentaML(cuentaId, orden, token);
             const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
-            const cuentaNombre = cuenta.nombre || cuentaId;
-
-            filasML.push({ ...filaML, cuenta: cuentaNombre });
-            filasVentas.push({
-              fechaHora: filaML.fechaHora,
-              nombre: filaML.nombre,
-              monto: filaML.monto,
-              unidadesPorColumna,
-            });
-            if (manual || filaML.montoExacto === false) {
-              filasRevisar.push({
-                id: filaML.numeroVenta,
-                cuenta: cuentaNombre,
-                fechaHora: filaML.fechaHora,
-                monto: filaML.monto,
-                montoExacto: filaML.montoExacto,
-                itemsSinResolver,
-              });
-            }
+            itemsCuenta.push({ filaML, unidadesPorColumna, manual, itemsSinResolver });
             marcasExportPendientes.push({ cuenta, ordenId: orden.id });
           } catch (err) {
             console.error(`Error resolviendo productos del export (orden ${orden.id}):`, err.response?.data || err.message);
             huboError = true;
+          }
+        }
+
+        // Si una compra se dividió en varias "órdenes" (mismo # de
+        // venta), se juntan acá en una sola fila antes de agregarlas
+        // al Excel - ver combinarFilasPorVenta.
+        const cuentaNombre = cuenta.nombre || cuentaId;
+        for (const { filaML, unidadesPorColumna, manual, itemsSinResolver } of combinarFilasPorVenta(itemsCuenta)) {
+          filasML.push({ ...filaML, cuenta: cuentaNombre });
+          filasVentas.push({
+            fechaHora: filaML.fechaHora,
+            nombre: filaML.nombre,
+            monto: filaML.monto,
+            unidadesPorColumna,
+          });
+          if (manual || filaML.montoExacto === false) {
+            filasRevisar.push({
+              id: filaML.numeroVenta,
+              cuenta: cuentaNombre,
+              fechaHora: filaML.fechaHora,
+              monto: filaML.monto,
+              montoExacto: filaML.montoExacto,
+              itemsSinResolver,
+            });
           }
         }
       }
@@ -2200,6 +2460,7 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
       if (limite) ordenesPendientes = ordenesPendientes.slice(0, limite);
       const cuentaNombre = cuenta.nombre || cuentaId;
 
+      const itemsCuenta = [];
       for (const orden of ordenesPendientes) {
         // Pausa chica entre ventas para no pisar el límite de la API
         // de facturación de Mercado Libre (ver comentario en
@@ -2207,7 +2468,12 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
         await new Promise((r) => setTimeout(r, 400));
         const filaML = await armarFilaVentaML(cuentaId, orden, token);
         const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
+        itemsCuenta.push({ filaML, unidadesPorColumna, manual, itemsSinResolver });
+      }
 
+      // Si una compra se dividió en varias "órdenes" (mismo # de
+      // venta), se juntan en una sola fila - ver combinarFilasPorVenta.
+      for (const { filaML, unidadesPorColumna, manual, itemsSinResolver } of combinarFilasPorVenta(itemsCuenta)) {
         filasML.push({ ...filaML, cuenta: cuentaNombre });
         filasVentas.push({
           fechaHora: filaML.fechaHora,
