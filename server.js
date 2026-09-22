@@ -2362,9 +2362,20 @@ app.get('/debug/reporte-ventas-ml', async (req, res) => {
     const { data: contenido } = await axios.get(`https://api.mercadolibre.com/billing/integration/reports/${fileId}`, {
       params: { document_type: 'BILL' },
       headers: { Authorization: `Bearer ${token}` },
-      responseType: 'text',
+      responseType: 'arraybuffer',
     });
-    res.type('text/plain').send(typeof contenido === 'string' ? contenido.slice(0, 20000) : JSON.stringify(contenido).slice(0, 20000));
+    const buffer = Buffer.from(contenido);
+    // Si son los primeros bytes "PK" es un zip (xlsx/ods), no texto plano.
+    const esBinario = buffer.length >= 2 && buffer[0] === 0x50 && buffer[1] === 0x4b;
+    if (req.query.base64) {
+      res.type('text/plain').send(buffer.toString('base64'));
+    } else if (esBinario) {
+      res.set('Content-Type', 'application/octet-stream');
+      res.set('Content-Disposition', `attachment; filename="reporte_${cuentaId}_${fileId}.xlsx"`);
+      res.send(buffer);
+    } else {
+      res.type('text/plain').send(buffer.toString('utf8').slice(0, 20000));
+    }
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
   }
@@ -2373,6 +2384,8 @@ app.get('/debug/reporte-ventas-ml', async (req, res) => {
 // Descarga un reporte ya generado (por fileId) sin volver a pedirlo -
 // para cuando /debug/reporte-ventas-ml avisó que todavía estaba
 // PROCESSING y hay que esperar y reintentar la descarga sola.
+// Agregá &base64=1 para recibirlo como texto base64 (útil para
+// reconstruir el archivo binario fuera del navegador).
 app.get('/debug/reporte-ventas-ml-descargar', async (req, res) => {
   const { id: cuentaId, error } = resolverCuentaId(req);
   if (error) return res.status(400).json({ error });
@@ -2383,9 +2396,19 @@ app.get('/debug/reporte-ventas-ml-descargar', async (req, res) => {
     const { data: contenido } = await axios.get(`https://api.mercadolibre.com/billing/integration/reports/${fileId}`, {
       params: { document_type: 'BILL' },
       headers: { Authorization: `Bearer ${token}` },
-      responseType: 'text',
+      responseType: 'arraybuffer',
     });
-    res.type('text/plain').send(typeof contenido === 'string' ? contenido.slice(0, 20000) : JSON.stringify(contenido).slice(0, 20000));
+    const buffer = Buffer.from(contenido);
+    const esBinario = buffer.length >= 2 && buffer[0] === 0x50 && buffer[1] === 0x4b;
+    if (req.query.base64) {
+      res.type('text/plain').send(buffer.toString('base64'));
+    } else if (esBinario) {
+      res.set('Content-Type', 'application/octet-stream');
+      res.set('Content-Disposition', `attachment; filename="reporte_${cuentaId}_${fileId}.xlsx"`);
+      res.send(buffer);
+    } else {
+      res.type('text/plain').send(buffer.toString('utf8').slice(0, 20000));
+    }
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
   }
