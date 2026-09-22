@@ -2326,7 +2326,7 @@ app.get('/debug/reporte-ventas-ml', async (req, res) => {
     const token = await getAccessToken(cuentaId);
 
     const { data: periodos } = await axios.get('https://api.mercadolibre.com/billing/integration/monthly/periods', {
-      params: { group: 'ML' },
+      params: { group: 'ML', document_type: 'BILL' },
       headers: { Authorization: `Bearer ${token}` },
     });
     const periodo = (periodos.results || []).find((p) => p.period_status === 'OPEN') || periodos.results?.[0];
