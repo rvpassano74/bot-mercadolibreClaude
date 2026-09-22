@@ -4,6 +4,7 @@ const axios = require('axios');
 const { google } = require('googleapis');
 const { PDFDocument } = require('pdf-lib');
 const FormData = require('form-data');
+const ExcelJS = require('exceljs');
 
 const app = express();
 app.use(express.json());
@@ -1056,6 +1057,7 @@ const {
   HORA_ETIQUETAS_VENTAS = '09:00',
   DIAS_VENTANA_ETIQUETAS_VENTAS = '3',
   PLANILLA_VENTAS_ACTIVA,
+  EXPORT_VENTAS_ACTIVA: EXPORT_VENTAS_ACTIVA_RAW,
 } = process.env;
 
 const VENTANA_DIAS = Number(DIAS_VENTANA_ETIQUETAS_VENTAS) || 3;
@@ -1068,6 +1070,252 @@ const VENTANA_DIAS = Number(DIAS_VENTANA_ETIQUETAS_VENTAS) || 3;
 const PLANILLA_ACTIVA = ['si', 'sí', 'true', '1'].includes(
   (PLANILLA_VENTAS_ACTIVA || '').toLowerCase().trim()
 );
+
+// =====================================================================
+// EXPORT DIARIO DE VENTAS A EXCEL (para pegar a mano en la planilla
+// local de control de stock) - equivalencias revisadas y aprobadas
+// por el usuario.
+// =====================================================================
+
+// Interruptor para prender el export diario de ventas a Excel por
+// Telegram. Por defecto queda APAGADO: hay que poner la variable de
+// entorno EXPORT_VENTAS_ACTIVA=si en Render cuando se confirme que
+// /debug/test-excel-ventas da un archivo correcto. Esto no toca para
+// nada la planilla de Google Sheets (PLANILLA_ACTIVA) ni las
+// etiquetas: es un feature aparte y completamente independiente.
+const EXPORT_VENTAS_ACTIVA = ['si', 'sí', 'true', '1'].includes(
+  (EXPORT_VENTAS_ACTIVA_RAW || '').toLowerCase().trim()
+);
+
+// Orden exacto de las 27 columnas de producto en la planilla local
+// del usuario (VentasSkin, columnas C a AC). Tiene que coincidir
+// EXACTAMENTE con ese orden para que el export se pueda pegar tal
+// cual sin tener que reacomodar columnas a mano.
+const CODES = [
+  '30G', '32G', '34G', 'Jeringa', 'C Nano', 'C 12', 'C 24', 'C 36', 'C 42', 'C 25/50',
+  'C 22/50', 'C 22/70', 'C 23/50', 'C 23/70', 'Can23/50 S', 'C 27/38', 'C18/50', 'C16/100',
+  'MN 34g', 'Nokor', 'Butt 21G', 'Butt 22G', 'But23G', 'MasK', 'DrPen', '2Vias', '12P',
+];
+
+// Tabla de equivalencias publicación/variación de Mercado Libre →
+// columna de la planilla local + cuántas unidades reales baja del
+// stock cada "1 venta" de ese listado (packs). Armada a partir del
+// listado completo de las 3 cuentas y revisada y corregida a mano por
+// el usuario (versión aprobada: "esta perfecta").
+//
+// Clave: "ITEM_ID" para publicaciones sin variantes, o
+// "ITEM_ID:VARIATION_ID" para publicaciones con variantes.
+// { manual: true } = no es un insumo mapeable automáticamente (por
+// ejemplo, un link de pago de Mercado Pago) - esas ventas quedan
+// siempre en la hoja "Revisar a mano" del export.
+const MAPEO_PRODUCTOS = {
+  'MLA2415985134': { columna: 'C 23/50', pack: 5 },
+  'MLA2141605102': { columna: 'Jeringa', pack: 100 },
+  'MLA2141553436': { columna: '34G', pack: 100 },
+  'MLA2141553908:197707086961': { columna: 'C18/50', pack: 20 },
+  'MLA2141553908:188657353129': { columna: 'C 22/70', pack: 20 },
+  'MLA2141553908:188657353131': { columna: 'C 22/50', pack: 20 },
+  'MLA2141553908:188657353133': { columna: 'C 23/50', pack: 20 },
+  'MLA2141553908:188657353135': { columna: 'C 25/50', pack: 20 },
+  'MLA2141553908:201116672175': { columna: 'C 27/38', pack: 20 },
+  'MLA2141205686': { columna: '32G', pack: 100 },
+  'MLA2161024258:188836181241': { columna: 'C 36', pack: 10 },
+  'MLA2161024258:197009243101': { columna: 'C 12', pack: 10 },
+  'MLA2161024258:188836181243': { columna: 'C 42', pack: 10 },
+  'MLA2161024258:188836181239': { columna: 'C 24', pack: 10 },
+  'MLA2161024258:197009243103': { columna: 'C Nano', pack: 10 },
+  'MLA1512311255': { columna: '30G', pack: 100 },
+  'MLA1510172985': { columna: 'C 23/70', pack: 50 },
+  'MLA1510097825': { columna: 'C 23/70', pack: 20 },
+  'MLA2413123784': { columna: 'C 22/50', pack: 5 },
+  'MLA1516475975:197650190241': { columna: 'C18/50', pack: 50 },
+  'MLA1516475975:189987343961': { columna: 'C 22/50', pack: 50 },
+  'MLA1516475975:189987343957': { columna: 'C 22/70', pack: 50 },
+  'MLA1516475975:189987343959': { columna: 'C 23/50', pack: 50 },
+  'MLA1516475975:189987343963': { columna: 'C 25/50', pack: 50 },
+  'MLA1516475975:201128292043': { columna: 'C 27/38', pack: 50 },
+  'MLA2416116974': { columna: 'C 22/50', pack: 10 },
+  'MLA2416101852': { columna: 'C 25/50', pack: 5 },
+  'MLA2180199320': { columna: 'C 23/70', pack: 100 },
+  'MLA2415989012': { columna: '30G', pack: 10 },
+  'MLA2416013372': { columna: 'C 22/70', pack: 10 },
+  'MLA2416143484': { columna: 'C 23/70', pack: 10 },
+  'MLA2416062938': { columna: 'C 22/70', pack: 5 },
+  'MLA2416052324': { columna: 'C 23/50', pack: 10 },
+  'MLA1568067257': { columna: '32G', pack: 10 },
+  'MLA1561950289': { columna: 'Butt 22G', pack: 10 },
+  'MLA2998760688': { columna: 'C18/50', pack: 5 },
+  'MLA2964207626': { columna: 'MN 34g', pack: 5 },
+  'MLA2470199678': { columna: 'Butt 21G', pack: 10 },
+  'MLA2424512590': { columna: 'Butt 21G', pack: 100 },
+  'MLA2424822464': { columna: 'Butt 22G', pack: 100 },
+  'MLA1561941139': { columna: 'Nokor', pack: 10 },
+  'MLA3011828862': { columna: 'C16/100', pack: 10 },
+  'MLA2470238340': { columna: 'But23G', pack: 50 },
+  'MLA1687003747': { columna: 'MN 34g', pack: 10 },
+  'MLA2470084364': { columna: 'But23G', pack: 10 },
+  'MLA3011906406': { columna: 'C16/100', pack: 5 },
+  'MLA1568041407': { columna: '34G', pack: 10 },
+  'MLA2470277284': { columna: 'Butt 21G', pack: 50 },
+  'MLA2424641412': { columna: 'But23G', pack: 100 },
+  'MLA2999163142': { columna: 'C18/50', pack: 10 },
+  'MLA2496547346': { columna: 'Nokor', pack: 12 },
+  'MLA1561950235': { columna: 'Butt 22G', pack: 50 },
+  'MLA1595904783': { columna: 'MasK', pack: 5 },
+  'MLA1810228721': { columna: 'C 25/50', pack: 10 },
+  'MLA1810335647': { columna: 'C 23/50', pack: 10 },
+  'MLA1810335649': { columna: 'C 22/50', pack: 10 },
+  'MLA1726305315': { columna: 'C 36', pack: 5 },
+  'MLA3392749642': { columna: 'C 27/38', pack: 5 },
+  'MLA3273596172': { columna: 'Jeringa', pack: 10 },
+  'MLA3250189400': { columna: 'C 27/38', pack: 5 },
+  'MLA3250176474': { columna: 'C 27/38', pack: 10 },
+  'MLA3392251534': { columna: 'C18/50', pack: 10 },
+  'MLA1810303075': { columna: 'C 22/50', pack: 5 },
+  'MLA3392749644': { columna: 'C 25/50', pack: 5 },
+  'MLA1810327667': { columna: 'C 22/70', pack: 5 },
+  'MLA1810322791': { columna: 'C 27/38', pack: 10 },
+  'MLA3118250768': { columna: 'C 24', pack: 5 },
+  'MLA3118239220': { columna: 'C 42', pack: 5 },
+  'MLA1726304917': { columna: 'C 12', pack: 5 },
+  'MLA1810297991': { columna: 'C 22/70', pack: 10 },
+  'MLA3118197410': { columna: 'C Nano', pack: 5 },
+  'MLA1810303073': { columna: 'C 23/50', pack: 5 },
+  'MLA1810326859': { columna: 'C18/50', pack: 5 },
+  'MLA3898110116': { columna: '12P', pack: 5 },
+  'MLA2052019001': { columna: '2Vias', pack: 4 },
+  'MLA2052019291': { columna: '2Vias', pack: 8 },
+  'MLA3592586320': { columna: 'MasK', pack: 5 },
+  'MLA3971339976': { columna: 'DrPen', pack: 1 },
+  'MLA3897984406': { columna: '12P', pack: 1 },
+  'MLA2341199946': { manual: true },
+  'MLA2141643736': { columna: '32G', pack: 100 },
+  'MLA2341251846': { manual: true },
+  'MLA2341239088': { columna: 'C 23/70', pack: 20 },
+  'MLA2341277942': { columna: '32G', pack: 100 },
+  'MLA1508863369': { columna: '34G', pack: 100 },
+  'MLA2340941506': { columna: '30G', pack: 100 },
+  'MLA2340941498': { columna: '34G', pack: 100 },
+  'MLA3029905850': { columna: 'Butt 22G', pack: 50 },
+  'MLA3118199112': { columna: 'C 24', pack: 10 },
+  'MLA3118199330': { columna: 'C 36', pack: 10 },
+  'MLA3118247562': { columna: 'C Nano', pack: 10 },
+  'MLA2406711990': { columna: '30G', pack: 100 },
+  'MLA3064997222': { columna: '34G', pack: 10 },
+  'MLA3118253116': { columna: 'C 42', pack: 10 },
+  'MLA1648703271': { columna: 'Butt 22G', pack: 100 },
+  'MLA2881093632': { columna: 'C 12', pack: 10 },
+  'MLA1648881451': { columna: 'But23G', pack: 100 },
+  'MLA1648945581': { columna: 'Butt 21G', pack: 100 },
+  'MLA1707927305': { columna: '32G', pack: 10 },
+  'MLA3029843806': { columna: 'But23G', pack: 50 },
+  'MLA3064404608': { columna: '30G', pack: 10 },
+  'MLA3249147600': { columna: 'Butt 21G', pack: 50 },
+  'MLA3631411530': { columna: 'But23G', pack: 10 },
+  'MLA3631411532': { columna: 'C18/50', pack: 20 },
+  'MLA3631411550': { columna: '34G', pack: 100 },
+  'MLA3631411552': { columna: 'MasK', pack: 5 },
+  'MLA3631411536': { columna: 'C 23/50', pack: 5 },
+  'MLA3631411522': { columna: 'C 12', pack: 5 },
+  'MLA3631411570': { columna: 'MN 34g', pack: 5 },
+  'MLA3631411512': { columna: 'Butt 21G', pack: 50 },
+  'MLA3631411538': { columna: '30G', pack: 10 },
+  'MLA3631411542': { columna: 'C18/50', pack: 5 },
+  'MLA1906041691': { columna: 'C18/50', pack: 10 },
+  'MLA3631411568': { columna: 'C 22/70', pack: 10 },
+  'MLA3631411558': { columna: 'C 36', pack: 5 },
+  'MLA3631411544': { columna: 'Butt 22G', pack: 10 },
+  'MLA3631411560': { columna: 'C 22/70', pack: 5 },
+  'MLA3631411510': { columna: 'But23G', pack: 100 },
+  'MLA3631411528': { columna: 'C 22/50', pack: 5 },
+  'MLA3631411516': { columna: '30G', pack: 100 },
+  'MLA1906041693': { columna: 'Butt 21G', pack: 10 },
+  'MLA1905871791': { columna: '32G', pack: 100 },
+  'MLA1906041649': { columna: '34G', pack: 10 },
+  'MLA1905871759': { columna: 'C 25/50', pack: 5 },
+  'MLA1905871777': { columna: 'Nokor', pack: 10 },
+  'MLA1905871773': { columna: 'C 27/38', pack: 5 },
+  'MLA1905871781': { columna: 'C 27/38', pack: 10 },
+  'MLA1906041687': { columna: 'Butt 22G', pack: 50 },
+  'MLA1906041677': { columna: 'C 23/70', pack: 10 },
+  'MLA1906041671': { columna: '32G', pack: 10 },
+  'MLA1905871805': { columna: 'C16/100', pack: 10 },
+  'MLA1905871779': { columna: 'Butt 21G', pack: 100 },
+  'MLA1906041665': { columna: 'But23G', pack: 50 },
+  'MLA1905871761': { columna: 'Jeringa', pack: 10 },
+  'MLA1906041673': { columna: 'C18/50', pack: 5 },
+  'MLA1906041663': { columna: 'C 22/50', pack: 10 },
+  'MLA1906041679': { columna: 'C 24', pack: 5 },
+  'MLA1906041647': { columna: 'C 42', pack: 5 },
+  'MLA1906041653': { columna: 'C18/50', pack: 10 },
+  'MLA1905871785': { columna: 'C16/100', pack: 5 },
+  'MLA1905871771': { columna: 'Jeringa', pack: 100 },
+  'MLA3635812634': { columna: 'C 23/50', pack: 10 },
+  'MLA3636238676': { columna: 'Butt 22G', pack: 100 },
+  'MLA1907796821': { columna: 'C 22/50', pack: 10 },
+  'MLA1907850203': { columna: 'C 22/50', pack: 20 },
+  'MLA3635556580': { columna: 'C 12', pack: 10 },
+  'MLA1905871749': { columna: 'C 23/50', pack: 10 },
+  'MLA1905871753': { columna: 'MN 34g', pack: 10 },
+  'MLA3635543256': { columna: 'C 36', pack: 10 },
+  'MLA3635540728': { columna: 'C Nano', pack: 5 },
+  'MLA1907795419': { columna: 'C 27/38', pack: 20 },
+  'MLA1907848909': { columna: 'C 22/70', pack: 5 },
+  'MLA1907808399': { columna: 'C 22/70', pack: 20 },
+  'MLA1907848905': { columna: 'C 25/50', pack: 5 },
+  'MLA1907850201': { columna: 'C 23/50', pack: 20 },
+  'MLA1907848907': { columna: 'C 22/50', pack: 5 },
+  'MLA1907794117': { columna: 'C 23/50', pack: 5 },
+  'MLA1907795417': { columna: 'C 25/50', pack: 20 },
+  'MLA3635812636': { columna: 'C 27/38', pack: 10 },
+  'MLA1907806991': { columna: 'C 27/38', pack: 5 },
+  'MLA1907797663': { columna: 'C 25/50', pack: 10 },
+  'MLA2051999525': { columna: '2Vias', pack: 4 },
+  'MLA2052019989': { columna: '2Vias', pack: 8 },
+  'MLA2106882457': { columna: 'DrPen', pack: 1 },
+  'MLA3898136142': { columna: '12P', pack: 1 },
+  'MLA3898112004': { columna: '12P', pack: 5 },
+  'MLA1907715929': { columna: 'C Nano', pack: 10 },
+  'MLA1907784769': { columna: 'C 22/70', pack: 10 },
+  'MLA1907714467': { columna: 'C 42', pack: 10 },
+  'MLA1907715179': { columna: 'C 24', pack: 10 },
+};
+
+// A partir de una orden de Mercado Libre, resuelve cuántas unidades
+// reales hay que descontar de cada columna de producto (ya aplicando
+// el tamaño de pack: si vendió 1 "pack x5", descuenta 5, no 1).
+// Si algún item de la orden no está en MAPEO_PRODUCTOS (publicación
+// nueva todavía no mapeada) o está marcado { manual: true }, la orden
+// entera se marca para revisar a mano, PERO los demás items que sí se
+// pudieron resolver igual se suman normalmente.
+function resolverProductosOrden(orden) {
+  const unidadesPorColumna = {};
+  let manual = false;
+  const itemsSinResolver = [];
+
+  for (const it of orden.order_items || []) {
+    const itemId = it.item?.id;
+    const variationId = it.item?.variation_id;
+    const clave = variationId ? `${itemId}:${variationId}` : itemId;
+    const mapeo = MAPEO_PRODUCTOS[clave];
+
+    if (!mapeo || mapeo.manual) {
+      manual = true;
+      itemsSinResolver.push({
+        item_id: itemId || '',
+        variation_id: variationId || '',
+        titulo: it.item?.title || '',
+        cantidad: it.quantity,
+      });
+      continue;
+    }
+
+    const unidadesReales = it.quantity * (mapeo.pack || 1);
+    unidadesPorColumna[mapeo.columna] = (unidadesPorColumna[mapeo.columna] || 0) + unidadesReales;
+  }
+
+  return { unidadesPorColumna, manual, itemsSinResolver };
+}
 
 // Ventas de hasta VENTANA_DIAS días atrás (para agarrar las que
 // llegaron tarde ayer), pero sin traer historial viejo de semanas.
@@ -1222,6 +1470,83 @@ async function enviarPDFPorTelegram(chatId, buffer, nombreArchivo, caption) {
 }
 
 // ---------------------------------------------------------------------
+// Export de ventas a Excel (listo para pegar a mano en la planilla local)
+// ---------------------------------------------------------------------
+
+async function enviarExcelPorTelegram(chatId, buffer, nombreArchivo, caption) {
+  const form = new FormData();
+  form.append('chat_id', chatId);
+  form.append('caption', caption);
+  form.append('document', buffer, {
+    filename: nombreArchivo,
+    contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  await axios.post(`${TELEGRAM_API}/sendDocument`, form, { headers: form.getHeaders() });
+}
+
+// Arma el archivo .xlsx del día: una hoja "Ventas" ya en el mismo
+// orden de columnas que la planilla local del usuario (lista para
+// copiar y pegar), y una hoja "Revisar a mano" con las órdenes que
+// tienen algún item sin mapear (publicación nueva, o el link de pago
+// de Mercado Pago), para que esas no se pierdan ni se carguen mal.
+async function crearExcelVentas(filasVentas, filasRevisar) {
+  const wb = new ExcelJS.Workbook();
+
+  const hojaVentas = wb.addWorksheet('Ventas');
+  hojaVentas.columns = [
+    { header: 'Fecha', key: 'fecha', width: 18 },
+    { header: 'Cuenta', key: 'cuenta', width: 16 },
+    { header: 'Nombre', key: 'nombre', width: 22 },
+    ...CODES.map((c) => ({ header: c, key: c, width: 10 })),
+    { header: 'Monto', key: 'monto', width: 12 },
+    { header: 'N° de venta', key: 'id', width: 16 },
+  ];
+  hojaVentas.getRow(1).font = { bold: true };
+  hojaVentas.getRow(1).fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FF1F3864' },
+  };
+  hojaVentas.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+
+  for (const f of filasVentas) {
+    const fila = { fecha: f.fecha, cuenta: f.cuenta, nombre: f.nombre, monto: f.monto, id: f.id };
+    for (const c of CODES) fila[c] = f.unidadesPorColumna[c] || '';
+    hojaVentas.addRow(fila);
+  }
+
+  const hojaRevisar = wb.addWorksheet('Revisar a mano');
+  hojaRevisar.columns = [
+    { header: 'Fecha', key: 'fecha', width: 18 },
+    { header: 'Cuenta', key: 'cuenta', width: 16 },
+    { header: 'N° de venta', key: 'id', width: 16 },
+    { header: 'Publicación (item_id)', key: 'item_id', width: 18 },
+    { header: 'Variación', key: 'variation_id', width: 16 },
+    { header: 'Título', key: 'titulo', width: 45 },
+    { header: 'Cantidad vendida', key: 'cantidad', width: 16 },
+  ];
+  hojaRevisar.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  hojaRevisar.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFB45309' } };
+
+  for (const f of filasRevisar) {
+    for (const it of f.itemsSinResolver) {
+      hojaRevisar.addRow({
+        fecha: f.fecha,
+        cuenta: f.cuenta,
+        id: f.id,
+        item_id: it.item_id,
+        variation_id: it.variation_id,
+        titulo: it.titulo,
+        cantidad: it.cantidad,
+      });
+    }
+  }
+
+  const buffer = await wb.xlsx.writeBuffer();
+  return Buffer.from(buffer);
+}
+
+// ---------------------------------------------------------------------
 // Corrida diaria: recorre las 3 cuentas, arma la planilla y las etiquetas
 // ---------------------------------------------------------------------
 
@@ -1253,6 +1578,9 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
   const buffersEtiquetas = [];
   const filasPlanilla = [];
   const marcasPendientes = []; // { cuenta, ordenId } - se confirman solo si la planilla se escribe bien
+  const filasExport = []; // filas para la hoja "Ventas" del Excel del día
+  const filasRevisar = []; // órdenes con algún item sin mapear, para la hoja "Revisar a mano"
+  const marcasExportPendientes = []; // { cuenta, ordenId } - se confirman solo si el Excel se manda bien
   let huboError = false;
 
   for (const cuentaId of Object.keys(data.cuentas || {})) {
@@ -1260,6 +1588,10 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
     if (!cuenta.refresh_token) continue;
     if (!Array.isArray(cuenta.etiquetas_generadas)) cuenta.etiquetas_generadas = [];
     if (!Array.isArray(cuenta.filas_planilla_cargadas)) cuenta.filas_planilla_cargadas = [];
+    // Tracking PROPIO para el export a Excel, separado a propósito de
+    // filas_planilla_cargadas (que es del feature viejo de Google
+    // Sheets, hoy pausado) para que un feature no contamine al otro.
+    if (!Array.isArray(cuenta.filas_export_cargadas)) cuenta.filas_export_cargadas = [];
 
     try {
       const token = await getAccessToken(cuentaId);
@@ -1294,6 +1626,46 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
             marcasPendientes.push({ cuenta, ordenId: orden.id });
           } catch (err) {
             console.error(`Error armando fila de planilla (orden ${orden.id}):`, err.response?.data || err.message);
+            huboError = true;
+          }
+        }
+      }
+
+      // --- Filas nuevas para el export a Excel (feature nuevo, ---
+      // --- independiente de la planilla de Google Sheets) ---
+      // Igual que con la planilla, no se marca la orden como "ya
+      // exportada" acá: se marca más abajo, solo si el Excel se llega
+      // a mandar bien por Telegram. Si falla el envío, estas ventas
+      // quedan pendientes y se reintentan solas en la corrida
+      // siguiente.
+      if (EXPORT_VENTAS_ACTIVA) {
+        for (const orden of ordenesPendientes) {
+          if (cuenta.filas_export_cargadas.includes(orden.id)) continue;
+          try {
+            const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
+            const filaBase = {
+              id: orden.id,
+              cuenta: cuenta.nombre || cuentaId,
+              fecha: new Intl.DateTimeFormat('es-AR', {
+                timeZone: ZONA_HORARIA,
+                day: '2-digit',
+                month: '2-digit',
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+              }).format(new Date(orden.date_created)),
+              nombre: orden.buyer?.nickname || '',
+              monto: orden.total_amount,
+            };
+            if (Object.keys(unidadesPorColumna).length) {
+              filasExport.push({ ...filaBase, unidadesPorColumna });
+            }
+            if (manual) {
+              filasRevisar.push({ ...filaBase, itemsSinResolver });
+            }
+            marcasExportPendientes.push({ cuenta, ordenId: orden.id });
+          } catch (err) {
+            console.error(`Error resolviendo productos del export (orden ${orden.id}):`, err.response?.data || err.message);
             huboError = true;
           }
         }
@@ -1374,6 +1746,34 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
     }
   }
 
+  // Generar y mandar por Telegram el Excel de ventas del día (para
+  // pegar a mano en la planilla local). Solo si el envío sale bien
+  // marcamos las órdenes como "ya exportadas" - mismo criterio que la
+  // planilla de Google Sheets, para no perder ventas si falla el envío.
+  let ventasExportadas = 0;
+  if (EXPORT_VENTAS_ACTIVA && (filasExport.length || filasRevisar.length)) {
+    try {
+      const excelBuffer = await crearExcelVentas(filasExport, filasRevisar);
+      const avisoRevisar = filasRevisar.length
+        ? ` ⚠️ ${filasRevisar.length} venta(s) con algún producto sin mapear - revisar hoja "Revisar a mano".`
+        : '';
+      await enviarExcelPorTelegram(
+        TELEGRAM_CHAT_ID,
+        excelBuffer,
+        `ventas_${hoy}.xlsx`,
+        `🧾 Ventas del ${hoy} - ${filasExport.length} fila(s) lista(s) para pegar en tu planilla.${avisoRevisar}`
+      );
+      for (const { cuenta, ordenId } of marcasExportPendientes) {
+        cuenta.filas_export_cargadas.push(ordenId);
+      }
+      ventasExportadas = marcasExportPendientes.length;
+      await saveData(data);
+    } catch (err) {
+      console.error('Error generando/mandando el Excel de ventas:', err.response?.data || err.message);
+      huboError = true;
+    }
+  }
+
   // Combinar y mandar las etiquetas por Telegram
   let pdfEnviado = false;
   if (buffersEtiquetas.length) {
@@ -1409,7 +1809,15 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
   if (!huboError) data.etiquetas_ventas_ultima_fecha = hoy;
   await saveData(data);
 
-  return { ok: !huboError, filas: filasGuardadas, filasIntentadas: filasPlanilla.length, etiquetas: buffersEtiquetas.length, pdfEnviado };
+  return {
+    ok: !huboError,
+    filas: filasGuardadas,
+    filasIntentadas: filasPlanilla.length,
+    etiquetas: buffersEtiquetas.length,
+    pdfEnviado,
+    ventasExportadas,
+    ventasParaRevisar: filasRevisar.length,
+  };
 }
 
 // Se llama cada 1 minuto (enganchado desde revisarTodo). Solo actúa
@@ -1437,6 +1845,61 @@ app.get('/debug/run-etiquetas-ventas', async (req, res) => {
     res.json(resultado);
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Prueba el export de ventas a Excel SIN tocar ningún estado guardado
+// (no marca ninguna orden como "ya exportada", así se puede correr
+// las veces que haga falta mientras se revisa que el archivo salga
+// bien, antes de prender EXPORT_VENTAS_ACTIVA=si en Render). Junta las
+// ventas pagadas de los últimos VENTANA_DIAS días de las 3 cuentas,
+// arma el Excel y lo manda por Telegram.
+app.get('/debug/test-excel-ventas', async (req, res) => {
+  const filasExport = [];
+  const filasRevisar = [];
+  try {
+    for (const cuentaId of Object.keys(data.cuentas || {})) {
+      const cuenta = data.cuentas[cuentaId];
+      if (!cuenta.refresh_token) continue;
+      const token = await getAccessToken(cuentaId);
+
+      const { data: resp } = await axios.get('https://api.mercadolibre.com/orders/search', {
+        params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 50 },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const ordenesPendientes = (resp.results || []).filter((o) => esVentaReciente(o.date_created));
+
+      for (const orden of ordenesPendientes) {
+        const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
+        const filaBase = {
+          id: orden.id,
+          cuenta: cuenta.nombre || cuentaId,
+          fecha: new Intl.DateTimeFormat('es-AR', {
+            timeZone: ZONA_HORARIA,
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+          }).format(new Date(orden.date_created)),
+          nombre: orden.buyer?.nickname || '',
+          monto: orden.total_amount,
+        };
+        if (Object.keys(unidadesPorColumna).length) filasExport.push({ ...filaBase, unidadesPorColumna });
+        if (manual) filasRevisar.push({ ...filaBase, itemsSinResolver });
+      }
+    }
+
+    const excelBuffer = await crearExcelVentas(filasExport, filasRevisar);
+    await enviarExcelPorTelegram(
+      TELEGRAM_CHAT_ID,
+      excelBuffer,
+      `PRUEBA_ventas_${fechaHoyAR()}.xlsx`,
+      `🧪 PRUEBA (no se marcó nada como exportado) - ${filasExport.length} fila(s), ${filasRevisar.length} para revisar a mano.`
+    );
+    res.json({ ok: true, filasExport: filasExport.length, filasRevisar: filasRevisar.length });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message, filasExport: filasExport.length, filasRevisar: filasRevisar.length });
   }
 });
 
