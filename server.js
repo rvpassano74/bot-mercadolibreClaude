@@ -2153,7 +2153,17 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
       `PRUEBA_ventas_${fechaHoyAR()}.xlsx`,
       `🧪 PRUEBA (no se marcó nada como exportado) - ${filasVentas.length} fila(s), ${filasRevisar.length} para revisar a mano.`
     );
-    res.json({ ok: true, filasVentas: filasVentas.length, filasRevisar: filasRevisar.length });
+    const porMontoFallido = filasRevisar.filter((f) => f.montoExacto === false);
+    const porProductoSinMapear = filasRevisar.filter((f) => f.itemsSinResolver && f.itemsSinResolver.length);
+    res.json({
+      ok: true,
+      filasVentas: filasVentas.length,
+      filasRevisar: filasRevisar.length,
+      porMontoFallido: porMontoFallido.length,
+      porProductoSinMapear: porProductoSinMapear.length,
+      ejemplosMontoFallido: porMontoFallido.slice(0, 5).map((f) => ({ id: f.id, cuenta: f.cuenta })),
+      ejemplosProductoSinMapear: porProductoSinMapear.slice(0, 5).map((f) => ({ id: f.id, cuenta: f.cuenta, items: f.itemsSinResolver })),
+    });
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message, filasVentas: filasVentas.length, filasRevisar: filasRevisar.length });
   }
