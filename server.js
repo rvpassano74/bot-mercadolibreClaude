@@ -1354,6 +1354,32 @@ function obtenerMontoNeto(orden) {
   return { monto: suma, exacto: true };
 }
 
+// ExcelJS arma la celda de fecha usando los componentes UTC del
+// objeto Date que le pasás (getUTCFullYear, getUTCHours, etc.), NO la
+// hora local del servidor ni ninguna zona horaria. Como Render corre
+// en UTC y la hora de la venta viene en horario de Argentina
+// (UTC-3), pasarle directo "new Date(orden.date_created)" hacía que
+// Excel mostrara la hora en UTC en vez de en hora argentina (por eso
+// se veía atrasada/adelantada varias horas). Este helper arma un Date
+// "trucado" cuyos campos UTC son iguales a la hora LOCAL de
+// Argentina, para que lo que ExcelJS escribe sea exactamente esa hora.
+function fechaExcelAR(fechaISO) {
+  const partes = new Intl.DateTimeFormat('en-CA', {
+    timeZone: ZONA_HORARIA,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date(fechaISO));
+  const p = {};
+  for (const parte of partes) p[parte.type] = parte.value;
+  const hora = Number(p.hour) === 24 ? 0 : Number(p.hour); // Intl a veces da "24" para medianoche
+  return new Date(Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), hora, Number(p.minute), Number(p.second)));
+}
+
 // El nombre real de facturación NO viene en un campo plano
 // (billing_info.name / billing_info.last_name, que es lo que se
 // había asumido antes) - viene adentro de un array
@@ -1421,7 +1447,7 @@ async function armarFilaVentaML(orden, token) {
     // en 2 filas (cada una con sus propios productos) - así como
     // Mercado Libre las junta en 1 sola fila en su reporte.
     numeroVenta: orden.pack_id || orden.id,
-    fechaHora: new Date(orden.date_created),
+    fechaHora: fechaExcelAR(orden.date_created),
     nombre,
     dni,
     provincia,
@@ -1625,6 +1651,7 @@ async function crearExcelVentas(filasML, filasVentas, filasRevisar) {
 
   const hojaML = wb.addWorksheet('VentasSkin ML');
   hojaML.columns = [
+    { header: 'Cuenta', key: 'cuenta', width: 16 },
     { header: 'ID', key: 'id', width: 16 },
     { header: 'Fecha', key: 'fecha', width: 18 },
     { header: 'Nombre', key: 'nombre', width: 26 },
@@ -1641,8 +1668,15 @@ async function crearExcelVentas(filasML, filasVentas, filasRevisar) {
     { header: 'Venta Publicidad', key: 'publicidad', width: 16 },
   ];
   estilarEncabezado(hojaML.getRow(1), 'FF1F3864');
-  for (const f of filasML) {
+  // Ordenada por cuenta y, dentro de cada cuenta, por fecha/hora.
+  const filasMLOrdenadas = [...filasML].sort((a, b) => {
+    const cuentaCmp = (a.cuenta || '').localeCompare(b.cuenta || '');
+    if (cuentaCmp !== 0) return cuentaCmp;
+    return a.fechaHora - b.fechaHora;
+  });
+  for (const f of filasMLOrdenadas) {
     hojaML.addRow({
+      cuenta: f.cuenta,
       id: String(f.numeroVenta ?? f.id),
       fecha: f.fechaHora,
       nombre: f.nombre,
@@ -1656,7 +1690,7 @@ async function crearExcelVentas(filasML, filasVentas, filasRevisar) {
       flexMonto: '',
       flexNumero: '',
       vacia: '',
-      publicidad: '',
+      publicidad: f.publicidad || '',
     });
   }
   hojaML.getColumn('fecha').numFmt = formatoFechaHora;
@@ -2220,12 +2254,15 @@ app.get('/debug/item-detalle', async (req, res) => {
 app.get('/debug/orden-billing', async (req, res) => {
   const { id: cuentaId, error } = resolverCuentaId(req);
   if (error) return res.status(400).json({ error });
-  const { orden } = req.query;
-  if (!orden) return res.status(400).json({ error: 'Falta el parámetro ?orden=ID_DE_LA_ORDEN' });
+  const { orden, pack } = req.query;
+  if (!orden && !pack) return res.status(400).json({ error: 'Falta el parámetro ?orden=ID_DE_LA_ORDEN o ?pack=ID_DEL_PAQUETE' });
   try {
     const token = await getAccessToken(cuentaId);
+    const params = { seller_id: cuentaId };
+    if (orden) params.order_ids = orden;
+    if (pack) params.pack_id = pack;
     const { data: detalle } = await axios.get('https://api.mercadolibre.com/billing/integration/group/ML/order/details', {
-      params: { order_ids: orden, seller_id: cuentaId },
+      params,
       headers: { Authorization: `Bearer ${token}` },
     });
     res.json(detalle);
@@ -2244,10 +2281,12 @@ app.get('/debug/orden-billing', async (req, res) => {
 app.get('/debug/ordenes-recientes', async (req, res) => {
   const { id: cuentaId, error } = resolverCuentaId(req);
   if (error) return res.status(400).json({ error });
+  const limit = Math.min(Number(req.query.limit) || 15, 50);
+  const offset = Number(req.query.offset) || 0;
   try {
     const token = await getAccessToken(cuentaId);
     const { data: resp } = await axios.get('https://api.mercadolibre.com/orders/search', {
-      params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 15 },
+      params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit, offset },
       headers: { Authorization: `Bearer ${token}` },
     });
     const resultado = [];
@@ -2268,6 +2307,8 @@ app.get('/debug/ordenes-recientes', async (req, res) => {
         shipping_id: orden.shipping?.id || null,
         fecha: orden.date_created,
         nickname_comprador: orden.buyer?.nickname || null,
+        tags: orden.tags || null,
+        context: orden.context || null,
         billing_info: billingInfo,
         error_billing_info: errorBilling,
       });
