@@ -1361,15 +1361,42 @@ function resolverProductosOrden(orden) {
 // pidiendo una de esas mismas órdenes sola, que anduvo perfecto. Este
 // helper reintenta con espera creciente cuando la respuesta es 429,
 // en vez de rendirse en el primer intento.
-async function axiosGetConReintento(url, config, intentos = 4) {
+// El límite real de Mercado Libre para estos endpoints de facturación
+// es MUY bajo (se vio literal "5 requests per minute" en un 429 real).
+// Reintentar reactivamente con una espera corta no alcanza cuando el
+// límite se resetea recién a los 60s - con 46 ventas x ~2 llamadas
+// cada una, esperar y reintentar de a poco seguía dejando ~40% de las
+// ventas sin poder calcularse. Por eso, en vez de solo reintentar,
+// esto ADEMÁS frena proactivamente antes de cada llamada para nunca
+// pasar de N llamadas por minuto (ventana deslizante), así se evita
+// pisar el límite en primer lugar. Se comparte entre
+// obtenerMontoNeto() y obtenerBonificacionEnvio() por las dudas de que
+// compartan el mismo límite de cuota.
+const historialLlamadasFacturacion = [];
+const LIMITE_LLAMADAS_FACTURACION_POR_MINUTO = 4; // margen por debajo del límite real (5/min) visto en Mercado Libre
+async function esperarTurnoFacturacion() {
+  const ahora = Date.now();
+  while (historialLlamadasFacturacion.length && ahora - historialLlamadasFacturacion[0] > 60000) {
+    historialLlamadasFacturacion.shift();
+  }
+  if (historialLlamadasFacturacion.length >= LIMITE_LLAMADAS_FACTURACION_POR_MINUTO) {
+    const espera = 60000 - (ahora - historialLlamadasFacturacion[0]) + 250;
+    await new Promise((r) => setTimeout(r, espera));
+    return esperarTurnoFacturacion();
+  }
+  historialLlamadasFacturacion.push(Date.now());
+}
+
+async function axiosGetConReintento(url, config, intentos = 5) {
   for (let intento = 0; intento < intentos; intento++) {
+    await esperarTurnoFacturacion();
     try {
       return await axios.get(url, config);
     } catch (err) {
       const esRateLimit = err.response?.status === 429;
       if (!esRateLimit || intento === intentos - 1) throw err;
       const esperaHeader = Number(err.response?.headers?.['retry-after']);
-      const espera = esperaHeader > 0 ? esperaHeader * 1000 : 1500 * Math.pow(2, intento);
+      const espera = esperaHeader > 0 ? esperaHeader * 1000 : 65000;
       await new Promise((r) => setTimeout(r, espera));
     }
   }
