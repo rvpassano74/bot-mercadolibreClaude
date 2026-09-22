@@ -1340,6 +1340,35 @@ function resolverProductosOrden(orden) {
 // el documento de facturación del período - por eso el número puede
 // ajustarse un poco en los días siguientes a la venta, aunque para el
 // control del día a día esto es lo más preciso que se puede sacar.
+// La "Bonificación por envío" (un crédito que Mercado Libre le devuelve
+// al vendedor, visible en el detalle de la venta en la web de ML) NO
+// aparece en ningún lado de billing/integration/group/ML/order/details
+// (ni en charge_info ni en discount_info) - se confirmó comparando a
+// mano contra un caso real (Sabrina, orden 2000018551812338: base
+// 34931.25 - cargos 9229.68 = 25701.57, pero el Total real era
+// 34691.57 - faltaban exactamente $8.990,00). Ese mismo número
+// ($8.990,00, exacto al centavo) SÍ aparece en
+// GET /shipments/{shipping_id}/costs, como receiver.discounts[].promoted_amount
+// (el descuento de envío que ML le regaló al comprador y que se le
+// compensa al vendedor). Por eso se sigue esa fuente para este
+// componente.
+async function obtenerBonificacionEnvio(shippingId, token) {
+  if (!shippingId) return 0;
+  try {
+    const { data: costos } = await axios.get(`https://api.mercadolibre.com/shipments/${shippingId}/costs`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const descuentos = costos?.receiver?.discounts || [];
+    if (descuentos.length) {
+      return descuentos.reduce((suma, d) => suma + (Number(d.promoted_amount) || 0), 0);
+    }
+    return Number(costos?.receiver?.save) || 0;
+  } catch (err) {
+    console.error(`(export) No se pudo traer costos de envío ${shippingId}:`, err.response?.data || err.message);
+    return 0;
+  }
+}
+
 async function obtenerMontoNeto(cuentaId, orden, token) {
   try {
     const { data: billing } = await axios.get(
@@ -1367,7 +1396,9 @@ async function obtenerMontoNeto(cuentaId, orden, token) {
       }
     }
 
-    return { monto: base - cargos - impuestos, exacto: true };
+    const bonificacionEnvio = await obtenerBonificacionEnvio(orden.shipping?.id, token);
+
+    return { monto: base - cargos - impuestos + bonificacionEnvio, exacto: true };
   } catch (err) {
     console.error(`(export) No se pudo traer facturación de la orden ${orden.id}:`, err.response?.data || err.message);
     return { monto: orden.total_amount, exacto: false };
