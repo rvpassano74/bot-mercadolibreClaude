@@ -1319,39 +1319,59 @@ function resolverProductosOrden(orden) {
 
 // El "total_amount" de una orden es el VALOR DE VENTA del producto
 // (lo que pagó el comprador), no lo que a vos te termina quedando: a
-// eso Mercado Libre le descuenta su comisión antes de depositártelo.
-// Este helper busca, dentro del detalle de pagos de la orden
-// (orden.payments[]), el monto neto real que te acreditan:
-//   1) "net_received_amount" si Mercado Libre lo manda (es el campo
-//      más directo: "neto a favor del vendedor").
-//   2) si no viene eso, "transaction_amount - marketplace_fee" (monto
-//      cobrado menos la comisión de Mercado Libre).
-//   3) si no hay forma de calcularlo con confianza, devuelve el monto
-//      bruto (total_amount) PERO con exacto:false, para que esa venta
-//      se marque en "Revisar a mano" en vez de mostrar un número que
-//      puede estar mal.
-// OJO: esto está armado con la estructura de pagos que documenta
-// Mercado Libre/Mercado Pago, pero todavía no se probó contra una
-// orden real (ver /debug/orden-detalle) - por eso el fallback seguro.
-function obtenerMontoNeto(orden) {
-  const pagos = (orden.payments || []).filter((p) => p && p.status !== 'rejected' && p.status !== 'cancelled');
-  if (!pagos.length) return { monto: orden.total_amount, exacto: false };
+// eso Mercado Libre le descuenta su comisión, costo fijo e impuestos
+// antes de depositártelo. La PRIMERA versión de este helper adivinaba
+// a partir de orden.payments[], pero no daba el número correcto.
+//
+// Esta versión usa la API oficial de Facturación de Mercado Libre
+// (GET /billing/integration/group/ML/order/details, la misma que
+// arma tu reporte "Ventas AR") y se VERIFICÓ contra una venta real
+// tuya (Laura Mariela Mendoza, orden 2000018552702348): con esta
+// fórmula da $15.230,64, exactamente lo que vos me dijiste que era el
+// monto real a recibir. La fórmula:
+//   monto neto = transaction_amount (precio de venta)
+//                - suma de todos los "charge_info.detail_amount" con
+//                  detail_type "CHARGE" (cargo por unidad vendida,
+//                  cargo por vender, costo de envío si lo hubiera, etc.)
+//                - impuestos retenidos (payment_info[].tax_details[])
+//
+// OJO importante: Mercado Libre marca estos cargos como
+// "legal_document_status: PROCESSING" (en proceso) hasta que cierra
+// el documento de facturación del período - por eso el número puede
+// ajustarse un poco en los días siguientes a la venta, aunque para el
+// control del día a día esto es lo más preciso que se puede sacar.
+async function obtenerMontoNeto(cuentaId, orden, token) {
+  try {
+    const { data: billing } = await axios.get(
+      'https://api.mercadolibre.com/billing/integration/group/ML/order/details',
+      { params: { order_ids: orden.id, seller_id: cuentaId }, headers: { Authorization: `Bearer ${token}` } }
+    );
+    const resultado = (billing.results || [])[0];
+    if (!resultado) return { monto: orden.total_amount, exacto: false };
 
-  let suma = 0;
-  let huboDatoConfiable = false;
-  for (const pago of pagos) {
-    if (typeof pago.net_received_amount === 'number') {
-      suma += pago.net_received_amount;
-      huboDatoConfiable = true;
-    } else if (typeof pago.transaction_amount === 'number' && typeof pago.marketplace_fee === 'number') {
-      suma += pago.transaction_amount - pago.marketplace_fee;
-      huboDatoConfiable = true;
-    } else if (typeof pago.transaction_amount === 'number') {
-      suma += pago.transaction_amount;
+    let base = null;
+    let cargos = 0;
+    for (const d of resultado.details || []) {
+      const montoTransaccion = d.sales_info?.[0]?.transaction_amount;
+      if (base === null && typeof montoTransaccion === 'number') base = montoTransaccion;
+      if (d.charge_info?.detail_type === 'CHARGE' && typeof d.charge_info?.detail_amount === 'number') {
+        cargos += d.charge_info.detail_amount;
+      }
     }
+    if (base === null) return { monto: orden.total_amount, exacto: false };
+
+    let impuestos = 0;
+    for (const pago of resultado.payment_info || []) {
+      for (const tax of pago.tax_details || []) {
+        impuestos += (Number(tax.original_amount) || 0) - (Number(tax.refunded_amount) || 0);
+      }
+    }
+
+    return { monto: base - cargos - impuestos, exacto: true };
+  } catch (err) {
+    console.error(`(export) No se pudo traer facturación de la orden ${orden.id}:`, err.response?.data || err.message);
+    return { monto: orden.total_amount, exacto: false };
   }
-  if (!huboDatoConfiable) return { monto: orden.total_amount, exacto: false };
-  return { monto: suma, exacto: true };
 }
 
 // ExcelJS arma la celda de fecha usando los componentes UTC del
@@ -1402,7 +1422,7 @@ function extraerNombreFacturacion(billingInfo) {
 // aparte, no toca la planilla de Google Sheets). Trae el nombre y DNI
 // reales de facturación (no el nickname de usuario de Mercado Libre) y
 // el monto NETO (ver obtenerMontoNeto), no el bruto.
-async function armarFilaVentaML(orden, token) {
+async function armarFilaVentaML(cuentaId, orden, token) {
   const productos = (orden.order_items || []).map((it) => it.item.title).join('; ');
   const unidades = (orden.order_items || []).reduce((suma, it) => suma + it.quantity, 0);
 
@@ -1433,7 +1453,7 @@ async function armarFilaVentaML(orden, token) {
   }
 
   const tipoEnvio = await obtenerTipoEnvio(token, orden.shipping?.id);
-  const { monto, exacto } = obtenerMontoNeto(orden);
+  const { monto, exacto } = await obtenerMontoNeto(cuentaId, orden, token);
 
   return {
     id: orden.id,
@@ -1842,7 +1862,7 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
         for (const orden of ordenesPendientes) {
           if (cuenta.filas_export_cargadas.includes(orden.id)) continue;
           try {
-            const filaML = await armarFilaVentaML(orden, token);
+            const filaML = await armarFilaVentaML(cuentaId, orden, token);
             const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
             const cuentaNombre = cuenta.nombre || cuentaId;
 
@@ -2072,7 +2092,7 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
       const cuentaNombre = cuenta.nombre || cuentaId;
 
       for (const orden of ordenesPendientes) {
-        const filaML = await armarFilaVentaML(orden, token);
+        const filaML = await armarFilaVentaML(cuentaId, orden, token);
         const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
 
         filasML.push({ ...filaML, cuenta: cuentaNombre });
@@ -2271,6 +2291,106 @@ app.get('/debug/orden-billing', async (req, res) => {
   }
 });
 
+// Trae el desglose de costos de un envío puntual - se usa para
+// investigar de dónde sale el monto de "Descuentos y bonificaciones"
+// que Mercado Libre muestra en el detalle de la venta (y que no
+// aparece en /debug/orden-billing), por si es una bonificación de
+// envío gratis atada al shipment y no a la orden.
+app.get('/debug/envio-costos', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const { shipping } = req.query;
+  if (!shipping) return res.status(400).json({ error: 'Falta el parámetro ?shipping=ID_DEL_ENVIO' });
+  try {
+    const token = await getAccessToken(cuentaId);
+    const { data: costos } = await axios.get(`https://api.mercadolibre.com/shipments/${shipping}/costs`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    res.json(costos);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Genera y descarga el mismo "reporte de conciliación" oficial que
+// bajás vos a mano desde el panel de Mercado Libre (el que tiene
+// "Total (ARS)", "Descuentos y bonificaciones" y "Venta por
+// publicidad" ya calculados por Mercado Libre) - lo pide para el
+// período de facturación vigente. Es un proceso en 3 pasos (generar,
+// esperar a que esté listo, descargar), así que puede tardar unos
+// segundos. Si todavía no está listo, avisa el estado para reintentar.
+app.get('/debug/reporte-ventas-ml', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  try {
+    const token = await getAccessToken(cuentaId);
+
+    const { data: periodos } = await axios.get('https://api.mercadolibre.com/billing/integration/monthly/periods', {
+      params: { group: 'ML' },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const periodo = (periodos.results || []).find((p) => p.period_status === 'OPEN') || periodos.results?.[0];
+    if (!periodo) return res.status(404).json({ error: 'No se encontró ningún período de facturación.', periodos });
+
+    const { data: gen } = await axios.post(
+      `https://api.mercadolibre.com/billing/integration/periods/key/${periodo.key}/reports`,
+      { group: 'ML', document_type: 'BILL', report_format: 'CSV' },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const fileId = gen.fileId || gen.file_id;
+    if (!fileId) return res.json({ ok: false, mensaje: 'No vino fileId en la respuesta de generación.', respuesta: gen });
+
+    let estado = 'PROCESSING';
+    for (let i = 0; i < 8 && estado === 'PROCESSING'; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const { data: st } = await axios.get(`https://api.mercadolibre.com/billing/integration/reports/${fileId}/status`, {
+        params: { document_type: 'BILL' },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      estado = st.status;
+    }
+    if (estado !== 'READY') {
+      return res.json({
+        ok: false,
+        estado,
+        fileId,
+        periodo: periodo.key,
+        mensaje: 'El reporte todavía se está generando. Probá de nuevo en unos minutos con /debug/reporte-ventas-ml-descargar?cuenta=...&fileId=' + fileId,
+      });
+    }
+
+    const { data: contenido } = await axios.get(`https://api.mercadolibre.com/billing/integration/reports/${fileId}`, {
+      params: { document_type: 'BILL' },
+      headers: { Authorization: `Bearer ${token}` },
+      responseType: 'text',
+    });
+    res.type('text/plain').send(typeof contenido === 'string' ? contenido.slice(0, 20000) : JSON.stringify(contenido).slice(0, 20000));
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Descarga un reporte ya generado (por fileId) sin volver a pedirlo -
+// para cuando /debug/reporte-ventas-ml avisó que todavía estaba
+// PROCESSING y hay que esperar y reintentar la descarga sola.
+app.get('/debug/reporte-ventas-ml-descargar', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const { fileId } = req.query;
+  if (!fileId) return res.status(400).json({ error: 'Falta el parámetro ?fileId=...' });
+  try {
+    const token = await getAccessToken(cuentaId);
+    const { data: contenido } = await axios.get(`https://api.mercadolibre.com/billing/integration/reports/${fileId}`, {
+      params: { document_type: 'BILL' },
+      headers: { Authorization: `Bearer ${token}` },
+      responseType: 'text',
+    });
+    res.type('text/plain').send(typeof contenido === 'string' ? contenido.slice(0, 20000) : JSON.stringify(contenido).slice(0, 20000));
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 // Lista las últimas ventas pagadas de una cuenta con TODOS los IDs
 // relacionados (order_id, pack_id, shipping_id) para poder comparar
 // contra el "# de venta" que muestra el reporte "Ventas AR" de
@@ -2320,10 +2440,9 @@ app.get('/debug/ordenes-recientes', async (req, res) => {
 });
 
 // Trae el detalle COMPLETO (sin filtrar campos) de una orden puntual,
-// con foco en orden.payments[] - sirve para confirmar, contra una
-// venta real, en qué campo viene exactamente el monto NETO que
-// Mercado Libre termina acreditando (net_received_amount,
-// marketplace_fee, etc.) y así confirmar/ajustar obtenerMontoNeto().
+// y de paso el monto neto calculado con obtenerMontoNeto() (que usa
+// la API de Facturación, ver más abajo) para poder comparar contra lo
+// que muestra Mercado Libre en el detalle de la venta.
 app.get('/debug/orden-detalle', async (req, res) => {
   const { id: cuentaId, error } = resolverCuentaId(req);
   if (error) return res.status(400).json({ error });
@@ -2334,7 +2453,7 @@ app.get('/debug/orden-detalle', async (req, res) => {
     const { data: detalle } = await axios.get(`https://api.mercadolibre.com/orders/${orden}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    const { monto, exacto } = obtenerMontoNeto(detalle);
+    const { monto, exacto } = await obtenerMontoNeto(cuentaId, detalle, token);
     res.json({
       total_amount: detalle.total_amount,
       monto_neto_calculado: monto,
