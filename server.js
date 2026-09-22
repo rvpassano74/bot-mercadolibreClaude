@@ -1558,6 +1558,25 @@ app.get('/debug/listado-publicaciones', async (req, res) => {
   }
 });
 
+// Trae el detalle COMPLETO (sin filtrar campos) de una publicación
+// puntual, para diagnosticar casos raros: si está pausada/cerrada, el
+// link público real, y si tiene variantes cargadas de verdad.
+app.get('/debug/item-detalle', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const { item } = req.query;
+  if (!item) return res.status(400).json({ error: 'Falta el parámetro ?item=ID_DE_LA_PUBLICACION' });
+  try {
+    const token = await getAccessToken(cuentaId);
+    const { data: detalle } = await axios.get(`https://api.mercadolibre.com/items/${item}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    res.json(detalle);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 async function start() {
   data = await loadData();
   await saveData(data); // por si se acaba de migrar del formato viejo
