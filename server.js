@@ -1317,6 +1317,96 @@ function resolverProductosOrden(orden) {
   return { unidadesPorColumna, manual, itemsSinResolver };
 }
 
+// El "total_amount" de una orden es el VALOR DE VENTA del producto
+// (lo que pagó el comprador), no lo que a vos te termina quedando: a
+// eso Mercado Libre le descuenta su comisión antes de depositártelo.
+// Este helper busca, dentro del detalle de pagos de la orden
+// (orden.payments[]), el monto neto real que te acreditan:
+//   1) "net_received_amount" si Mercado Libre lo manda (es el campo
+//      más directo: "neto a favor del vendedor").
+//   2) si no viene eso, "transaction_amount - marketplace_fee" (monto
+//      cobrado menos la comisión de Mercado Libre).
+//   3) si no hay forma de calcularlo con confianza, devuelve el monto
+//      bruto (total_amount) PERO con exacto:false, para que esa venta
+//      se marque en "Revisar a mano" en vez de mostrar un número que
+//      puede estar mal.
+// OJO: esto está armado con la estructura de pagos que documenta
+// Mercado Libre/Mercado Pago, pero todavía no se probó contra una
+// orden real (ver /debug/orden-detalle) - por eso el fallback seguro.
+function obtenerMontoNeto(orden) {
+  const pagos = (orden.payments || []).filter((p) => p && p.status !== 'rejected' && p.status !== 'cancelled');
+  if (!pagos.length) return { monto: orden.total_amount, exacto: false };
+
+  let suma = 0;
+  let huboDatoConfiable = false;
+  for (const pago of pagos) {
+    if (typeof pago.net_received_amount === 'number') {
+      suma += pago.net_received_amount;
+      huboDatoConfiable = true;
+    } else if (typeof pago.transaction_amount === 'number' && typeof pago.marketplace_fee === 'number') {
+      suma += pago.transaction_amount - pago.marketplace_fee;
+      huboDatoConfiable = true;
+    } else if (typeof pago.transaction_amount === 'number') {
+      suma += pago.transaction_amount;
+    }
+  }
+  if (!huboDatoConfiable) return { monto: orden.total_amount, exacto: false };
+  return { monto: suma, exacto: true };
+}
+
+// Igual que armarFilaPlanilla, pero para el export a Excel (feature
+// aparte, no toca la planilla de Google Sheets). Trae el nombre y DNI
+// reales de facturación (no el nickname de usuario de Mercado Libre) y
+// el monto NETO (ver obtenerMontoNeto), no el bruto.
+async function armarFilaVentaML(orden, token) {
+  const productos = (orden.order_items || []).map((it) => it.item.title).join('; ');
+  const unidades = (orden.order_items || []).reduce((suma, it) => suma + it.quantity, 0);
+
+  let nombre = orden.buyer?.nickname || '';
+  let dni = '';
+  try {
+    const { data: fact } = await axios.get(
+      `https://api.mercadolibre.com/orders/${orden.id}/billing_info`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (fact?.billing_info?.doc_number) dni = fact.billing_info.doc_number;
+    if (fact?.billing_info?.name) {
+      nombre = `${fact.billing_info.name} ${fact.billing_info.last_name || ''}`.trim();
+    }
+  } catch (err) {
+    console.error(`(export) No se pudo traer facturación de la orden ${orden.id}:`, err.response?.data || err.message);
+  }
+
+  let provincia = '';
+  if (orden.shipping?.id) {
+    try {
+      const { data: envio } = await axios.get(`https://api.mercadolibre.com/shipments/${orden.shipping.id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      provincia = envio.receiver_address?.state?.name || '';
+    } catch (err) {
+      console.error(`(export) No se pudo traer envío de la orden ${orden.id}:`, err.response?.data || err.message);
+    }
+  }
+
+  const tipoEnvio = await obtenerTipoEnvio(token, orden.shipping?.id);
+  const { monto, exacto } = obtenerMontoNeto(orden);
+
+  return {
+    id: orden.id,
+    fechaHora: new Date(orden.date_created),
+    nombre,
+    dni,
+    provincia,
+    monto,
+    montoExacto: exacto,
+    titulo: productos,
+    unidades,
+    envio: tipoEnvio,
+    publicidad: '',
+  };
+}
+
 // Ventas de hasta VENTANA_DIAS días atrás (para agarrar las que
 // llegaron tarde ayer), pero sin traer historial viejo de semanas.
 function esVentaReciente(fechaISO) {
@@ -1484,63 +1574,111 @@ async function enviarExcelPorTelegram(chatId, buffer, nombreArchivo, caption) {
   await axios.post(`${TELEGRAM_API}/sendDocument`, form, { headers: form.getHeaders() });
 }
 
-// Arma el archivo .xlsx del día: una hoja "Ventas" ya en el mismo
-// orden de columnas que la planilla local del usuario (lista para
-// copiar y pegar), y una hoja "Revisar a mano" con las órdenes que
-// tienen algún item sin mapear (publicación nueva, o el link de pago
-// de Mercado Pago), para que esas no se pierdan ni se carguen mal.
-async function crearExcelVentas(filasVentas, filasRevisar) {
+function estilarEncabezado(fila, colorFondo) {
+  fila.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  fila.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colorFondo } };
+}
+
+// Arma el archivo .xlsx del día con 3 hojas:
+//  - "VentasSkin ML": mismas 14 columnas, en el mismo orden, que tu
+//    solapa VentasSkin ML (ID | Fecha | Nombre | DNI | Teléfono |
+//    Dirección | Monto | Título de la publicación | Unidades | Envío |
+//    Flex $ | Flex # | (vacía) | Venta Publicidad).
+//  - "VentasSkin": Fecha | Nombre | las 27 columnas de producto (mismo
+//    orden que tu solapa VentasSkin) | Monto - una fila por venta,
+//    lista para copiar y pegar debajo de tus datos ya cargados.
+//  - "Revisar a mano": todo lo que el bot no pudo resolver solo, para
+//    que no se pierda ni se cargue mal: productos sin mapear en
+//    MAPEO_PRODUCTOS, y ventas donde no se pudo calcular con
+//    confianza el monto neto (ver obtenerMontoNeto).
+async function crearExcelVentas(filasML, filasVentas, filasRevisar) {
   const wb = new ExcelJS.Workbook();
+  const formatoFechaHora = 'dd/mm/yyyy hh:mm';
+  const formatoFecha = 'dd/mm/yyyy';
 
-  const hojaVentas = wb.addWorksheet('Ventas');
-  hojaVentas.columns = [
+  const hojaML = wb.addWorksheet('VentasSkin ML');
+  hojaML.columns = [
+    { header: 'ID', key: 'id', width: 16 },
     { header: 'Fecha', key: 'fecha', width: 18 },
-    { header: 'Cuenta', key: 'cuenta', width: 16 },
-    { header: 'Nombre', key: 'nombre', width: 22 },
-    ...CODES.map((c) => ({ header: c, key: c, width: 10 })),
-    { header: 'Monto', key: 'monto', width: 12 },
-    { header: 'N° de venta', key: 'id', width: 16 },
+    { header: 'Nombre', key: 'nombre', width: 26 },
+    { header: 'DNI', key: 'dni', width: 14 },
+    { header: 'Teléfono', key: 'telefono', width: 14 },
+    { header: 'Dirección', key: 'provincia', width: 16 },
+    { header: 'Monto', key: 'monto', width: 14 },
+    { header: 'Título de la publicación', key: 'titulo', width: 45 },
+    { header: 'Unidades', key: 'unidades', width: 12 },
+    { header: 'Envio', key: 'envio', width: 12 },
+    { header: 'Flex $', key: 'flexMonto', width: 10 },
+    { header: 'Flex #', key: 'flexNumero', width: 10 },
+    { header: '', key: 'vacia', width: 6 },
+    { header: 'Venta Publicidad', key: 'publicidad', width: 16 },
   ];
-  hojaVentas.getRow(1).font = { bold: true };
-  hojaVentas.getRow(1).fill = {
-    type: 'pattern',
-    pattern: 'solid',
-    fgColor: { argb: 'FF1F3864' },
-  };
-  hojaVentas.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  estilarEncabezado(hojaML.getRow(1), 'FF1F3864');
+  for (const f of filasML) {
+    hojaML.addRow({
+      id: String(f.id),
+      fecha: f.fechaHora,
+      nombre: f.nombre,
+      dni: f.dni,
+      telefono: '',
+      provincia: f.provincia,
+      monto: f.monto,
+      titulo: f.titulo,
+      unidades: f.unidades,
+      envio: f.envio,
+      flexMonto: '',
+      flexNumero: '',
+      vacia: '',
+      publicidad: '',
+    });
+  }
+  hojaML.getColumn('fecha').numFmt = formatoFechaHora;
 
+  const hojaVentas = wb.addWorksheet('VentasSkin');
+  hojaVentas.columns = [
+    { header: 'Fecha', key: 'fecha', width: 14 },
+    { header: 'Nombre', key: 'nombre', width: 26 },
+    ...CODES.map((c) => ({ header: c, key: c, width: 10 })),
+    { header: 'Monto', key: 'monto', width: 14 },
+  ];
+  estilarEncabezado(hojaVentas.getRow(1), 'FF1F3864');
   for (const f of filasVentas) {
-    const fila = { fecha: f.fecha, cuenta: f.cuenta, nombre: f.nombre, monto: f.monto, id: f.id };
+    const fila = { fecha: f.fechaHora, nombre: f.nombre, monto: f.monto };
     for (const c of CODES) fila[c] = f.unidadesPorColumna[c] || '';
     hojaVentas.addRow(fila);
   }
+  hojaVentas.getColumn('fecha').numFmt = formatoFecha;
 
   const hojaRevisar = wb.addWorksheet('Revisar a mano');
   hojaRevisar.columns = [
     { header: 'Fecha', key: 'fecha', width: 18 },
     { header: 'Cuenta', key: 'cuenta', width: 16 },
     { header: 'N° de venta', key: 'id', width: 16 },
-    { header: 'Publicación (item_id)', key: 'item_id', width: 18 },
-    { header: 'Variación', key: 'variation_id', width: 16 },
-    { header: 'Título', key: 'titulo', width: 45 },
-    { header: 'Cantidad vendida', key: 'cantidad', width: 16 },
+    { header: 'Tipo', key: 'tipo', width: 20 },
+    { header: 'Detalle', key: 'detalle', width: 60 },
   ];
-  hojaRevisar.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-  hojaRevisar.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFB45309' } };
-
+  estilarEncabezado(hojaRevisar.getRow(1), 'FFB45309');
   for (const f of filasRevisar) {
-    for (const it of f.itemsSinResolver) {
+    for (const it of f.itemsSinResolver || []) {
       hojaRevisar.addRow({
-        fecha: f.fecha,
+        fecha: f.fechaHora,
         cuenta: f.cuenta,
         id: f.id,
-        item_id: it.item_id,
-        variation_id: it.variation_id,
-        titulo: it.titulo,
-        cantidad: it.cantidad,
+        tipo: 'Producto sin mapear',
+        detalle: `${it.titulo} (${it.item_id}${it.variation_id ? ':' + it.variation_id : ''}) - cantidad: ${it.cantidad}`,
+      });
+    }
+    if (f.montoExacto === false) {
+      hojaRevisar.addRow({
+        fecha: f.fechaHora,
+        cuenta: f.cuenta,
+        id: f.id,
+        tipo: 'Monto sin confirmar',
+        detalle: `Se usó el monto bruto de la venta ($${f.monto}) porque no se pudo calcular el neto real con seguridad.`,
       });
     }
   }
+  hojaRevisar.getColumn('fecha').numFmt = formatoFechaHora;
 
   const buffer = await wb.xlsx.writeBuffer();
   return Buffer.from(buffer);
@@ -1578,8 +1716,9 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
   const buffersEtiquetas = [];
   const filasPlanilla = [];
   const marcasPendientes = []; // { cuenta, ordenId } - se confirman solo si la planilla se escribe bien
-  const filasExport = []; // filas para la hoja "Ventas" del Excel del día
-  const filasRevisar = []; // órdenes con algún item sin mapear, para la hoja "Revisar a mano"
+  const filasML = []; // filas para la hoja "VentasSkin ML" del Excel del día
+  const filasVentas = []; // filas para la hoja "VentasSkin" (Fecha, Nombre, productos, Monto)
+  const filasRevisar = []; // ventas con algo que revisar a mano (producto sin mapear o monto sin confirmar)
   const marcasExportPendientes = []; // { cuenta, ordenId } - se confirman solo si el Excel se manda bien
   let huboError = false;
 
@@ -1642,26 +1781,26 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
         for (const orden of ordenesPendientes) {
           if (cuenta.filas_export_cargadas.includes(orden.id)) continue;
           try {
+            const filaML = await armarFilaVentaML(orden, token);
             const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
-            const filaBase = {
-              id: orden.id,
-              cuenta: cuenta.nombre || cuentaId,
-              fecha: new Intl.DateTimeFormat('es-AR', {
-                timeZone: ZONA_HORARIA,
-                day: '2-digit',
-                month: '2-digit',
-                year: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit',
-              }).format(new Date(orden.date_created)),
-              nombre: orden.buyer?.nickname || '',
-              monto: orden.total_amount,
-            };
-            if (Object.keys(unidadesPorColumna).length) {
-              filasExport.push({ ...filaBase, unidadesPorColumna });
-            }
-            if (manual) {
-              filasRevisar.push({ ...filaBase, itemsSinResolver });
+            const cuentaNombre = cuenta.nombre || cuentaId;
+
+            filasML.push({ ...filaML, cuenta: cuentaNombre });
+            filasVentas.push({
+              fechaHora: filaML.fechaHora,
+              nombre: filaML.nombre,
+              monto: filaML.monto,
+              unidadesPorColumna,
+            });
+            if (manual || filaML.montoExacto === false) {
+              filasRevisar.push({
+                id: orden.id,
+                cuenta: cuentaNombre,
+                fechaHora: filaML.fechaHora,
+                monto: filaML.monto,
+                montoExacto: filaML.montoExacto,
+                itemsSinResolver,
+              });
             }
             marcasExportPendientes.push({ cuenta, ordenId: orden.id });
           } catch (err) {
@@ -1751,17 +1890,17 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
   // marcamos las órdenes como "ya exportadas" - mismo criterio que la
   // planilla de Google Sheets, para no perder ventas si falla el envío.
   let ventasExportadas = 0;
-  if (EXPORT_VENTAS_ACTIVA && (filasExport.length || filasRevisar.length)) {
+  if (EXPORT_VENTAS_ACTIVA && (filasVentas.length || filasRevisar.length)) {
     try {
-      const excelBuffer = await crearExcelVentas(filasExport, filasRevisar);
+      const excelBuffer = await crearExcelVentas(filasML, filasVentas, filasRevisar);
       const avisoRevisar = filasRevisar.length
-        ? ` ⚠️ ${filasRevisar.length} venta(s) con algún producto sin mapear - revisar hoja "Revisar a mano".`
+        ? ` ⚠️ ${filasRevisar.length} venta(s) para revisar a mano (producto sin mapear o monto sin confirmar).`
         : '';
       await enviarExcelPorTelegram(
         TELEGRAM_CHAT_ID,
         excelBuffer,
         `ventas_${hoy}.xlsx`,
-        `🧾 Ventas del ${hoy} - ${filasExport.length} fila(s) lista(s) para pegar en tu planilla.${avisoRevisar}`
+        `🧾 Ventas del ${hoy} - ${filasVentas.length} fila(s) lista(s) para pegar en tu planilla.${avisoRevisar}`
       );
       for (const { cuenta, ordenId } of marcasExportPendientes) {
         cuenta.filas_export_cargadas.push(ordenId);
@@ -1855,7 +1994,8 @@ app.get('/debug/run-etiquetas-ventas', async (req, res) => {
 // ventas pagadas de los últimos VENTANA_DIAS días de las 3 cuentas,
 // arma el Excel y lo manda por Telegram.
 app.get('/debug/test-excel-ventas', async (req, res) => {
-  const filasExport = [];
+  const filasML = [];
+  const filasVentas = [];
   const filasRevisar = [];
   try {
     for (const cuentaId of Object.keys(data.cuentas || {})) {
@@ -1868,38 +2008,42 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
         headers: { Authorization: `Bearer ${token}` },
       });
       const ordenesPendientes = (resp.results || []).filter((o) => esVentaReciente(o.date_created));
+      const cuentaNombre = cuenta.nombre || cuentaId;
 
       for (const orden of ordenesPendientes) {
+        const filaML = await armarFilaVentaML(orden, token);
         const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
-        const filaBase = {
-          id: orden.id,
-          cuenta: cuenta.nombre || cuentaId,
-          fecha: new Intl.DateTimeFormat('es-AR', {
-            timeZone: ZONA_HORARIA,
-            day: '2-digit',
-            month: '2-digit',
-            year: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit',
-          }).format(new Date(orden.date_created)),
-          nombre: orden.buyer?.nickname || '',
-          monto: orden.total_amount,
-        };
-        if (Object.keys(unidadesPorColumna).length) filasExport.push({ ...filaBase, unidadesPorColumna });
-        if (manual) filasRevisar.push({ ...filaBase, itemsSinResolver });
+
+        filasML.push({ ...filaML, cuenta: cuentaNombre });
+        filasVentas.push({
+          fechaHora: filaML.fechaHora,
+          nombre: filaML.nombre,
+          monto: filaML.monto,
+          unidadesPorColumna,
+        });
+        if (manual || filaML.montoExacto === false) {
+          filasRevisar.push({
+            id: orden.id,
+            cuenta: cuentaNombre,
+            fechaHora: filaML.fechaHora,
+            monto: filaML.monto,
+            montoExacto: filaML.montoExacto,
+            itemsSinResolver,
+          });
+        }
       }
     }
 
-    const excelBuffer = await crearExcelVentas(filasExport, filasRevisar);
+    const excelBuffer = await crearExcelVentas(filasML, filasVentas, filasRevisar);
     await enviarExcelPorTelegram(
       TELEGRAM_CHAT_ID,
       excelBuffer,
       `PRUEBA_ventas_${fechaHoyAR()}.xlsx`,
-      `🧪 PRUEBA (no se marcó nada como exportado) - ${filasExport.length} fila(s), ${filasRevisar.length} para revisar a mano.`
+      `🧪 PRUEBA (no se marcó nada como exportado) - ${filasVentas.length} fila(s), ${filasRevisar.length} para revisar a mano.`
     );
-    res.json({ ok: true, filasExport: filasExport.length, filasRevisar: filasRevisar.length });
+    res.json({ ok: true, filasVentas: filasVentas.length, filasRevisar: filasRevisar.length });
   } catch (err) {
-    res.status(500).json({ error: err.response?.data || err.message, filasExport: filasExport.length, filasRevisar: filasRevisar.length });
+    res.status(500).json({ error: err.response?.data || err.message, filasVentas: filasVentas.length, filasRevisar: filasRevisar.length });
   }
 });
 
@@ -2035,6 +2179,34 @@ app.get('/debug/item-detalle', async (req, res) => {
       headers: { Authorization: `Bearer ${token}` },
     });
     res.json(detalle);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Trae el detalle COMPLETO (sin filtrar campos) de una orden puntual,
+// con foco en orden.payments[] - sirve para confirmar, contra una
+// venta real, en qué campo viene exactamente el monto NETO que
+// Mercado Libre termina acreditando (net_received_amount,
+// marketplace_fee, etc.) y así confirmar/ajustar obtenerMontoNeto().
+app.get('/debug/orden-detalle', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const { orden } = req.query;
+  if (!orden) return res.status(400).json({ error: 'Falta el parámetro ?orden=ID_DE_LA_ORDEN' });
+  try {
+    const token = await getAccessToken(cuentaId);
+    const { data: detalle } = await axios.get(`https://api.mercadolibre.com/orders/${orden}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const { monto, exacto } = obtenerMontoNeto(detalle);
+    res.json({
+      total_amount: detalle.total_amount,
+      monto_neto_calculado: monto,
+      exacto,
+      payments: detalle.payments,
+      orden_completa: detalle,
+    });
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
   }
