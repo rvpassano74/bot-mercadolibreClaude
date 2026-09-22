@@ -1500,6 +1500,64 @@ app.get('/debug/ids-cargados', (req, res) => {
   });
 });
 
+// Lista todas las publicaciones activas de las 3 cuentas (ID + título),
+// para armar a mano la tabla de equivalencias con las columnas de
+// productos de la planilla de stock.
+app.get('/debug/listado-publicaciones', async (req, res) => {
+  const resultado = [];
+  try {
+    for (const cuentaId of Object.keys(data.cuentas || {})) {
+      const cuenta = data.cuentas[cuentaId];
+      if (!cuenta.refresh_token) continue;
+      const token = await getAccessToken(cuentaId);
+
+      const { data: idsResponse } = await axios.get(
+        `https://api.mercadolibre.com/users/${cuentaId}/items/search`,
+        { params: { status: 'active', limit: 100 }, headers: { Authorization: `Bearer ${token}` } }
+      );
+      const itemIds = idsResponse.results || [];
+
+      for (const grupo of partirEnGrupos(itemIds, 20)) {
+        const { data: items } = await axios.get('https://api.mercadolibre.com/items', {
+          params: { ids: grupo.join(','), attributes: 'id,title,available_quantity,variations' },
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        for (const { body: item } of items) {
+          if (!item) continue;
+          if (Array.isArray(item.variations) && item.variations.length) {
+            for (const v of item.variations) {
+              const atributos = (v.attribute_combinations || [])
+                .map((a) => a.value_name)
+                .filter(Boolean)
+                .join(' / ');
+              resultado.push({
+                cuenta: cuenta.nombre || cuentaId,
+                item_id: item.id,
+                variation_id: v.id,
+                titulo: item.title,
+                variacion: atributos,
+                stock_disponible: v.available_quantity,
+              });
+            }
+          } else {
+            resultado.push({
+              cuenta: cuenta.nombre || cuentaId,
+              item_id: item.id,
+              variation_id: '',
+              titulo: item.title,
+              variacion: '',
+              stock_disponible: item.available_quantity,
+            });
+          }
+        }
+      }
+    }
+    res.json({ cantidad: resultado.length, publicaciones: resultado });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message, parcial: resultado });
+  }
+});
+
 async function start() {
   data = await loadData();
   await saveData(data); // por si se acaba de migrar del formato viejo
