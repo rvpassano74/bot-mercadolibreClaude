@@ -2132,12 +2132,35 @@ app.get('/debug/run-etiquetas-ventas', async (req, res) => {
 // bien, antes de prender EXPORT_VENTAS_ACTIVA=si en Render). Junta las
 // ventas pagadas de los últimos VENTANA_DIAS días de las 3 cuentas,
 // arma el Excel y lo manda por Telegram.
+// Guarda el resultado de la última prueba en memoria para poder
+// consultarlo con /debug/ultimo-test-excel-ventas sin depender de que
+// la conexión HTTP original siga abierta (con muchas ventas, el
+// proceso puede tardar varios minutos por las pausas/reintentos del
+// rate-limit de Mercado Libre, más de lo que aguanta una conexión
+// HTTP normal).
+let ultimoResultadoTestExcel = null;
+
 app.get('/debug/test-excel-ventas', async (req, res) => {
+  // Filtros opcionales para pruebas rápidas: ?cuenta=178600583 (una
+  // sola cuenta) y/o ?limite=5 (solo las primeras N ventas de esa
+  // cuenta/cuentas, para no esperar varios minutos).
+  const cuentaFiltro = req.query.cuenta ? String(req.query.cuenta) : null;
+  const limite = req.query.limite ? Number(req.query.limite) : null;
+
+  // Se responde YA (no se espera a que termine el proceso) porque con
+  // muchas ventas esto puede tardar varios minutos (pausas + reintentos
+  // por el rate-limit de Mercado Libre) y una conexión HTTP normal
+  // (o el proxy de Render) se corta antes de que termine. El
+  // resultado real llega por Telegram, y también queda guardado para
+  // consultarlo con /debug/ultimo-test-excel-ventas.
+  res.json({ ok: true, mensaje: 'Arrancó en segundo plano. El Excel llega por Telegram; el resumen también queda en /debug/ultimo-test-excel-ventas.' });
+
   const filasML = [];
   const filasVentas = [];
   const filasRevisar = [];
   try {
     for (const cuentaId of Object.keys(data.cuentas || {})) {
+      if (cuentaFiltro && cuentaId !== cuentaFiltro) continue;
       const cuenta = data.cuentas[cuentaId];
       if (!cuenta.refresh_token) continue;
       const token = await getAccessToken(cuentaId);
@@ -2146,7 +2169,8 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
         params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 50 },
         headers: { Authorization: `Bearer ${token}` },
       });
-      const ordenesPendientes = (resp.results || []).filter((o) => esVentaReciente(o.date_created));
+      let ordenesPendientes = (resp.results || []).filter((o) => esVentaReciente(o.date_created));
+      if (limite) ordenesPendientes = ordenesPendientes.slice(0, limite);
       const cuentaNombre = cuenta.nombre || cuentaId;
 
       for (const orden of ordenesPendientes) {
@@ -2186,18 +2210,30 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
     );
     const porMontoFallido = filasRevisar.filter((f) => f.montoExacto === false);
     const porProductoSinMapear = filasRevisar.filter((f) => f.itemsSinResolver && f.itemsSinResolver.length);
-    res.json({
+    ultimoResultadoTestExcel = {
       ok: true,
+      terminadoEn: new Date().toISOString(),
       filasVentas: filasVentas.length,
       filasRevisar: filasRevisar.length,
       porMontoFallido: porMontoFallido.length,
       porProductoSinMapear: porProductoSinMapear.length,
       ejemplosMontoFallido: porMontoFallido.slice(0, 5).map((f) => ({ id: f.id, cuenta: f.cuenta })),
       ejemplosProductoSinMapear: porProductoSinMapear.slice(0, 5).map((f) => ({ id: f.id, cuenta: f.cuenta, items: f.itemsSinResolver })),
-    });
+    };
   } catch (err) {
-    res.status(500).json({ error: err.response?.data || err.message, filasVentas: filasVentas.length, filasRevisar: filasRevisar.length });
+    console.error('Error en /debug/test-excel-ventas:', err.response?.data || err.message);
+    ultimoResultadoTestExcel = {
+      ok: false,
+      terminadoEn: new Date().toISOString(),
+      error: err.response?.data || err.message,
+      filasVentas: filasVentas.length,
+      filasRevisar: filasRevisar.length,
+    };
   }
+});
+
+app.get('/debug/ultimo-test-excel-ventas', (req, res) => {
+  res.json(ultimoResultadoTestExcel || { ok: null, mensaje: 'Todavía no corrió ninguna prueba (o el servidor se reinició desde la última).' });
 });
 
 // Prueba solo el acceso a la planilla, escribiendo una fila de prueba.
