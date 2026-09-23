@@ -2110,6 +2110,13 @@ async function crearExcelVentas(filasML, filasVentas, filasRevisar) {
 // ventas dos veces en la planilla.
 let etiquetasVentasEnCurso = false;
 
+// Guarda el resultado de la última corrida que realmente se ejecutó
+// (no las que se saltearon por "ya en curso" / "ya corrió hoy"), para
+// poder consultarlo desde /debug/estado-corrida SIN disparar una
+// corrida nueva. Fundamental para no tener que "probar en producción"
+// cada vez que se quiere ver cómo salió algo.
+let ultimoResultadoCorridaDiaria = null;
+
 async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
   const hoy = fechaHoyAR();
   if (!forzar && data.etiquetas_ventas_ultima_fecha === hoy) {
@@ -2121,7 +2128,16 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
   etiquetasVentasEnCurso = true;
 
   try {
-    return await ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy });
+    const resultado = await ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy });
+    ultimoResultadoCorridaDiaria = { ...resultado, cuando: new Date().toISOString() };
+    return resultado;
+  } catch (err) {
+    ultimoResultadoCorridaDiaria = {
+      ok: false,
+      error: err.response?.data || err.message,
+      cuando: new Date().toISOString(),
+    };
+    throw err;
   } finally {
     etiquetasVentasEnCurso = false;
   }
@@ -2510,6 +2526,33 @@ app.get('/debug/run-etiquetas-ventas', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
   }
+});
+
+// Solo LEE estado guardado - no llama a la API de Mercado Libre ni
+// dispara ninguna corrida. Para ver qué pasó sin arriesgarse a
+// disparar un proceso nuevo por accidente (a diferencia de
+// /debug/run-etiquetas-ventas, que SIEMPRE arranca una corrida).
+app.get('/debug/estado-corrida', (req, res) => {
+  const cuentas = {};
+  for (const [id, cuenta] of Object.entries(data.cuentas || {})) {
+    cuentas[id] = {
+      nombre: cuenta.nombre || id,
+      etiquetas_generadas: (cuenta.etiquetas_generadas || []).length,
+      filas_export_cargadas: (cuenta.filas_export_cargadas || []).length,
+      filas_planilla_cargadas: (cuenta.filas_planilla_cargadas || []).length,
+    };
+  }
+  res.json({
+    ahora: new Date().toISOString(),
+    horaAR: horaAhoraAR(),
+    hoyAR: fechaHoyAR(),
+    corridaEnCurso: etiquetasVentasEnCurso,
+    etiquetas_ventas_ultima_fecha: data.etiquetas_ventas_ultima_fecha || null,
+    EXPORT_VENTAS_ACTIVA,
+    PLANILLA_ACTIVA,
+    ultimaCorrida: ultimoResultadoCorridaDiaria,
+    cuentas,
+  });
 });
 
 // Rescate puntual para el bug de hoy (ya arreglado en el código, esto
