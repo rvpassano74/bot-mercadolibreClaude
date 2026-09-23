@@ -1097,12 +1097,21 @@ const {
   GOOGLE_SHEET_ID,
   GOOGLE_SHEET_TAB = 'Hoja 1',
   HORA_ETIQUETAS_VENTAS = '09:00',
-  DIAS_VENTANA_ETIQUETAS_VENTAS = '3',
+  DIAS_VENTANA_ETIQUETAS_VENTAS = '1',
   PLANILLA_VENTAS_ACTIVA,
   EXPORT_VENTAS_ACTIVA: EXPORT_VENTAS_ACTIVA_RAW,
 } = process.env;
 
-const VENTANA_DIAS = Number(DIAS_VENTANA_ETIQUETAS_VENTAS) || 3;
+// Ventana de "cuántos días para atrás" se considera una venta
+// reciente (no calendario - son últimas 24hs x VENTANA_DIAS desde
+// ahora). Antes eran 3 días "por las dudas", pero eso hacía que
+// cualquier reproceso (como liberar etiquetas trabadas) trajera de
+// vuelta un montón de ventas viejas ya resueltas a mano, e inflaba
+// mucho el export de ventas (que es lento por el límite de Mercado
+// Libre). Con 1 día alcanza de sobra para no perder una venta que
+// llegó tarde a la noche, y el bot igual nunca reprocesa una venta ya
+// marcada como hecha, sea cual sea la ventana.
+const VENTANA_DIAS = Number(DIAS_VENTANA_ETIQUETAS_VENTAS) || 1;
 
 // Interruptor para pausar SOLO la carga automática a la planilla de
 // Google Sheets, sin tocar nada de las etiquetas (que siguen andando
