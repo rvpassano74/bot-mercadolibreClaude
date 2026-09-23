@@ -534,11 +534,22 @@ async function revisarVentasNuevas() {
 
         agregarVentaPorDia(orden.date_created, Number(orden.total_amount));
 
+        // OJO: guardamos acá mismo, orden por orden, en vez de una
+        // sola vez al final del lote. Antes se guardaba una sola vez
+        // después de todo el "for" - si el proceso se reiniciaba a
+        // mitad de un lote grande (como pasó varias veces hoy), las
+        // ventas ya avisadas y ya sumadas al resumen NO habían llegado
+        // a guardarse, así que en el próximo arranque se volvían a
+        // contar como "nuevas": se re-avisaban por Telegram Y se
+        // duplicaban en el conteo del resumen de las 12hs (flex/normal).
+        // Guardando después de cada una, como mucho se puede duplicar
+        // 1 sola venta (la que estaba a mitad de proceso justo en el
+        // reinicio), no todo el lote.
         cuenta.ventas_notificadas.push(orden.id);
+        await saveData(data);
       }
 
       if (nuevas.length > 0) {
-        await saveData(data);
         console.log(`💰 [${cuenta.nombre}] se avisaron ${nuevas.length} venta(s) nueva(s).`);
       }
     } catch (err) {
