@@ -612,6 +612,46 @@ function partirEnGrupos(lista, tamano) {
   return grupos;
 }
 
+// Descarga las etiquetas de un grupo de shipment_ids. Si Mercado Libre
+// rechaza el pedido completo porque ALGUNO de esos envíos ya no está
+// en estado "imprimible" (por ejemplo, porque ya se despachó a mano
+// mientras el bot no andaba - pasa el error SHPLAB0200 /
+// NOT_PRINTABLE_STATUS), antes esto hacía fallar TODO el grupo y no
+// se bajaba ninguna etiqueta, ni siquiera las que sí estaban bien.
+// Ahora: saca del pedido los que Mercado Libre marcó como no
+// imprimibles (esos se dan por "ya resueltos", no hace falta bajarlos)
+// y reintenta una vez con el resto.
+async function descargarEtiquetasDeGrupo(grupo, token) {
+  let idsAIntentar = [...grupo];
+  const idsNoImprimibles = [];
+  for (let intento = 0; intento < 2 && idsAIntentar.length; intento++) {
+    try {
+      const resp = await axios.get('https://api.mercadolibre.com/shipment_labels', {
+        params: { shipment_ids: idsAIntentar.join(','), response_type: 'pdf' },
+        headers: { Authorization: `Bearer ${token}` },
+        responseType: 'arraybuffer',
+      });
+      return { buffer: Buffer.from(resp.data), idsDescargados: idsAIntentar, idsNoImprimibles };
+    } catch (err) {
+      let cuerpo = null;
+      try {
+        const texto = Buffer.isBuffer(err.response?.data) ? err.response.data.toString('utf8') : err.response?.data;
+        cuerpo = typeof texto === 'string' ? JSON.parse(texto) : texto;
+      } catch (_) {
+        // no vino un JSON legible - error distinto, se propaga tal cual
+      }
+      const noImprimibles = (cuerpo?.failed_shipments || [])
+        .filter((f) => f.cause === 'NOT_PRINTABLE_STATUS' || f.error_code === 'SHPLAB0200')
+        .map((f) => String(f.shipment_id));
+      if (!noImprimibles.length) throw err; // error de otro tipo - no sabemos qué hacer, se propaga
+      idsNoImprimibles.push(...noImprimibles);
+      idsAIntentar = idsAIntentar.filter((id) => !noImprimibles.includes(String(id)));
+    }
+  }
+  // Se quedó sin nada para bajar (todo el grupo era no-imprimible).
+  return { buffer: null, idsDescargados: [], idsNoImprimibles };
+}
+
 async function revisarStockBajo() {
   for (const cuentaId of Object.keys(data.cuentas || {})) {
     const cuenta = data.cuentas[cuentaId];
@@ -2066,7 +2106,16 @@ async function crearExcelVentas(filasML, filasVentas, filasRevisar) {
     { header: 'Monto', key: 'monto', width: 14 },
   ];
   estilarEncabezado(hojaVentas.getRow(1), 'FF1F3864');
-  for (const f of filasVentas) {
+  // Mismo orden que la solapa "VentasSkin ML" (por cuenta y, dentro de
+  // cada cuenta, por fecha/hora) - antes esta solapa quedaba en el
+  // orden en que se iban procesando las cuentas/ventas, que no
+  // coincidía con la otra solapa.
+  const filasVentasOrdenadas = [...filasVentas].sort((a, b) => {
+    const cuentaCmp = (a.cuenta || '').localeCompare(b.cuenta || '');
+    if (cuentaCmp !== 0) return cuentaCmp;
+    return a.fechaHora - b.fechaHora;
+  });
+  for (const f of filasVentasOrdenadas) {
     const fila = { fecha: f.fechaHora, nombre: f.nombre, monto: f.monto };
     for (const c of CODES) fila[c] = f.unidadesPorColumna[c] || '';
     hojaVentas.addRow(fila);
@@ -2196,6 +2245,7 @@ async function procesarExportVentas(ordenesPorCuenta) {
       for (const { filaML, unidadesPorColumna, manual, itemsSinResolver } of combinarFilasPorVenta(itemsCuenta)) {
         filasML.push({ ...filaML, cuenta: cuentaNombre });
         filasVentas.push({
+          cuenta: cuentaNombre,
           fechaHora: filaML.fechaHora,
           nombre: filaML.nombre,
           monto: filaML.monto,
@@ -2362,12 +2412,8 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
 
       for (const grupo of partirEnGrupos(shipmentIdsNuevos, 20)) {
         try {
-          const resp2 = await axios.get('https://api.mercadolibre.com/shipment_labels', {
-            params: { shipment_ids: grupo.join(','), response_type: 'pdf' },
-            headers: { Authorization: `Bearer ${token}` },
-            responseType: 'arraybuffer',
-          });
-          buffersEtiquetas.push(Buffer.from(resp2.data));
+          const { buffer, idsDescargados, idsNoImprimibles } = await descargarEtiquetasDeGrupo(grupo, token);
+          if (buffer) buffersEtiquetas.push(buffer);
           // OJO: acá NO marcamos todavía cuenta.etiquetas_generadas. Se
           // marca recién más abajo, después de que el PDF combinado de
           // TODAS las cuentas se haya mandado bien por Telegram. Antes
@@ -2376,7 +2422,12 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
           // envío final del PDF combinado, esa etiqueta quedaba
           // marcada como "ya generada" para siempre sin haberse
           // mandado nunca. Esto es justo lo que pasó hoy.
-          grupo.forEach((id) => marcasEtiquetasPendientes.push({ cuenta, shipmentId: id }));
+          idsDescargados.forEach((id) => marcasEtiquetasPendientes.push({ cuenta, shipmentId: id }));
+          // Los que Mercado Libre dice que ya no son imprimibles (por
+          // ej. ya se despacharon a mano) se marcan como generados
+          // igual, aunque no se haya bajado ni mandado nada - así no
+          // se reintentan solos todos los días.
+          idsNoImprimibles.forEach((id) => marcasEtiquetasPendientes.push({ cuenta, shipmentId: id }));
         } catch (err) {
           const msg = JSON.stringify(err.response?.data) || err.message;
           console.error(`Error bajando etiquetas de ${cuenta.nombre}:`, msg);
@@ -2704,6 +2755,7 @@ app.get('/debug/test-excel-ventas', async (req, res) => {
       for (const { filaML, unidadesPorColumna, manual, itemsSinResolver } of combinarFilasPorVenta(itemsCuenta)) {
         filasML.push({ ...filaML, cuenta: cuentaNombre });
         filasVentas.push({
+          cuenta: cuentaNombre,
           fechaHora: filaML.fechaHora,
           nombre: filaML.nombre,
           monto: filaML.monto,
