@@ -2161,6 +2161,7 @@ async function procesarExportVentas(ordenesPorCuenta) {
   const filasVentas = [];
   const filasRevisar = [];
   const marcasExportPendientes = [];
+  const errores = [];
   let huboError = false;
 
   for (const [cuentaId, ordenesPendientes] of Object.entries(ordenesPorCuenta)) {
@@ -2181,7 +2182,9 @@ async function procesarExportVentas(ordenesPorCuenta) {
           itemsCuenta.push({ filaML, unidadesPorColumna, manual, itemsSinResolver });
           marcasExportPendientes.push({ cuenta, ordenId: orden.id });
         } catch (err) {
-          console.error(`Error resolviendo productos del export (orden ${orden.id}):`, err.response?.data || err.message);
+          const msg = JSON.stringify(err.response?.data) || err.message;
+          console.error(`Error resolviendo productos del export (orden ${orden.id}):`, msg);
+          errores.push(`export orden ${orden.id} (${cuentaId}): ${msg}`);
           huboError = true;
         }
       }
@@ -2210,12 +2213,14 @@ async function procesarExportVentas(ordenesPorCuenta) {
         }
       }
     } catch (err) {
-      console.error(`Error procesando export de ventas de ${cuenta.nombre}:`, err.response?.data || err.message);
+      const msg = JSON.stringify(err.response?.data) || err.message;
+      console.error(`Error procesando export de ventas de ${cuenta.nombre}:`, msg);
+      errores.push(`export cuenta ${cuenta.nombre} (${cuentaId}): ${msg}`);
       huboError = true;
     }
   }
 
-  return { filasML, filasVentas, filasRevisar, marcasExportPendientes, huboError };
+  return { filasML, filasVentas, filasRevisar, marcasExportPendientes, huboError, errores };
 }
 
 // Arma el Excel con lo que devolvió procesarExportVentas() y lo manda
@@ -2260,6 +2265,7 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
   // "ordenesPorCuenta" guarda las órdenes ya pedidas en la primera
   // pasada, para no volver a pedirlas al procesar el export.
   const ordenesPorCuenta = {};
+  const errores = []; // mensajes concretos para /debug/estado-corrida - así no hay que adivinar ni mirar logs de Render
   let huboError = false;
 
   for (const cuentaId of Object.keys(data.cuentas || {})) {
@@ -2304,7 +2310,9 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
             filasPlanilla.push(fila);
             marcasPendientes.push({ cuenta, ordenId: orden.id });
           } catch (err) {
-            console.error(`Error armando fila de planilla (orden ${orden.id}):`, err.response?.data || err.message);
+            const msg = JSON.stringify(err.response?.data) || err.message;
+            console.error(`Error armando fila de planilla (orden ${orden.id}):`, msg);
+            errores.push(`planilla orden ${orden.id}: ${msg}`);
             huboError = true;
           }
         }
@@ -2370,14 +2378,18 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
           // mandado nunca. Esto es justo lo que pasó hoy.
           grupo.forEach((id) => marcasEtiquetasPendientes.push({ cuenta, shipmentId: id }));
         } catch (err) {
-          console.error(`Error bajando etiquetas de ${cuenta.nombre}:`, err.response?.data || err.message);
+          const msg = JSON.stringify(err.response?.data) || err.message;
+          console.error(`Error bajando etiquetas de ${cuenta.nombre}:`, msg);
+          errores.push(`etiquetas ${cuenta.nombre}: ${msg}`);
           huboError = true;
         }
       }
 
       await saveData(data);
     } catch (err) {
-      console.error(`Error en corrida diaria de ${cuenta.nombre}:`, err.response?.data || err.message);
+      const msg = JSON.stringify(err.response?.data) || err.message;
+      console.error(`Error en corrida diaria de ${cuenta.nombre}:`, msg);
+      errores.push(`cuenta ${cuenta.nombre} (${cuentaId}): ${msg}`);
       huboError = true;
     }
   }
@@ -2395,7 +2407,9 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
       filasGuardadas = filasPlanilla.length;
       await saveData(data);
     } catch (err) {
-      console.error('Error escribiendo en la planilla de Google Sheets:', err.response?.data || err.message);
+      const msg = JSON.stringify(err.response?.data) || err.message;
+      console.error('Error escribiendo en la planilla de Google Sheets:', msg);
+      errores.push(`planilla (guardado): ${msg}`);
       huboError = true;
     }
   }
@@ -2451,7 +2465,9 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
       }
       await saveData(data);
     } catch (err) {
-      console.error('Error combinando/mandando el PDF de etiquetas:', err.response?.data || err.message);
+      const msg = JSON.stringify(err.response?.data) || err.message;
+      console.error('Error combinando/mandando el PDF de etiquetas:', msg);
+      errores.push(`PDF etiquetas: ${msg}`);
       huboError = true;
     }
   } else if (!forzar && data.etiquetas_ventas_aviso_vacio_fecha !== hoy) {
@@ -2474,11 +2490,14 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
     // El export terminó dentro del tiempo de espera: se manda el
     // Excel ahora, junto con las etiquetas de arriba.
     if (resultadoExport?.huboError) huboError = true;
+    if (resultadoExport?.errores?.length) errores.push(...resultadoExport.errores);
     if (resultadoExport) {
       try {
         ventasExportadas = await armarYMandarExcelVentas(resultadoExport, hoy);
       } catch (err) {
-        console.error('Error generando/mandando el Excel de ventas:', err.response?.data || err.message);
+        const msg = JSON.stringify(err.response?.data) || err.message;
+        console.error('Error generando/mandando el Excel de ventas:', msg);
+        errores.push(`Excel ventas (envío): ${msg}`);
         huboError = true;
       }
     }
@@ -2506,6 +2525,8 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
     pdfEnviado,
     ventasExportadas,
     ventasParaRevisar: resultadoExport?.filasRevisar?.length || 0,
+    exportListoATiempo,
+    errores,
   };
 }
 
