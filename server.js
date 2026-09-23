@@ -2218,6 +2218,7 @@ async function armarYMandarExcelVentas(resultado, hoy) {
 
 async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
   const buffersEtiquetas = [];
+  const marcasEtiquetasPendientes = []; // { cuenta, shipmentId } - se confirman solo si el PDF se manda bien
   const filasPlanilla = [];
   const marcasPendientes = []; // { cuenta, ordenId } - se confirman solo si la planilla se escribe bien
   // El export de ventas a Excel es LENTO a propósito (respeta un
@@ -2334,7 +2335,15 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
             responseType: 'arraybuffer',
           });
           buffersEtiquetas.push(Buffer.from(resp2.data));
-          grupo.forEach((id) => cuenta.etiquetas_generadas.push(id));
+          // OJO: acá NO marcamos todavía cuenta.etiquetas_generadas. Se
+          // marca recién más abajo, después de que el PDF combinado de
+          // TODAS las cuentas se haya mandado bien por Telegram. Antes
+          // se marcaba acá mismo, apenas bajada - y si el proceso se
+          // reiniciaba (o se colgaba en otra cuenta) antes de llegar al
+          // envío final del PDF combinado, esa etiqueta quedaba
+          // marcada como "ya generada" para siempre sin haberse
+          // mandado nunca. Esto es justo lo que pasó hoy.
+          grupo.forEach((id) => marcasEtiquetasPendientes.push({ cuenta, shipmentId: id }));
         } catch (err) {
           console.error(`Error bajando etiquetas de ${cuenta.nombre}:`, err.response?.data || err.message);
           huboError = true;
@@ -2408,6 +2417,14 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
         `📦 Etiquetas del ${hoy} — ${avisoPlanilla}`
       );
       pdfEnviado = true;
+      // Recién ahora que el PDF combinado se mandó bien confirmamos
+      // las etiquetas como "ya generadas" - mismo criterio que la
+      // planilla y el export de ventas (ver comentario donde se arma
+      // marcasEtiquetasPendientes).
+      for (const { cuenta, shipmentId } of marcasEtiquetasPendientes) {
+        cuenta.etiquetas_generadas.push(shipmentId);
+      }
+      await saveData(data);
     } catch (err) {
       console.error('Error combinando/mandando el PDF de etiquetas:', err.response?.data || err.message);
       huboError = true;
@@ -2490,6 +2507,62 @@ app.get('/debug/run-etiquetas-ventas', async (req, res) => {
   try {
     const resultado = await corridaDiariaEtiquetasYVentas({ forzar: true });
     res.json(resultado);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Rescate puntual para el bug de hoy (ya arreglado en el código, esto
+// es para recuperar lo que quedó mal marcado ANTES del arreglo): si un
+// reinicio del proceso interrumpía la corrida después de bajar una
+// etiqueta pero antes de mandar el PDF combinado, esa etiqueta quedaba
+// marcada como "ya generada" sin haberse mandado nunca, y no se
+// volvía a intentar. Esta ruta, para UNA cuenta puntual (?cuenta=ID),
+// vuelve a pedir sus ventas recientes y saca de la lista de
+// "generadas" las que todavía están pendientes - así la corrida
+// normal las vuelve a bajar y mandar. Solo toca ventas recientes
+// (mismo criterio que la corrida diaria), no historial viejo.
+app.get('/debug/liberar-etiquetas', async (req, res) => {
+  try {
+    const cuentaId = req.query.cuenta;
+    if (!cuentaId || !data.cuentas[cuentaId]) {
+      return res.status(400).json({
+        error: 'Pasá ?cuenta=ID con un id válido.',
+        cuentasDisponibles: Object.keys(data.cuentas || {}),
+      });
+    }
+    const cuenta = data.cuentas[cuentaId];
+    if (!Array.isArray(cuenta.etiquetas_generadas)) cuenta.etiquetas_generadas = [];
+
+    const token = await getAccessToken(cuentaId);
+    const { data: resp } = await axios.get('https://api.mercadolibre.com/orders/search', {
+      params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 50 },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const ordenesRecientes = (resp.results || []).filter((o) => esVentaReciente(o.date_created));
+
+    const liberadas = [];
+    for (const orden of ordenesRecientes) {
+      const shipmentId = orden.shipping?.id;
+      if (!shipmentId) continue;
+      const idx = cuenta.etiquetas_generadas.indexOf(shipmentId);
+      if (idx !== -1) {
+        cuenta.etiquetas_generadas.splice(idx, 1);
+        liberadas.push(shipmentId);
+      }
+    }
+    await saveData(data);
+
+    res.json({
+      ok: true,
+      cuenta: cuenta.nombre || cuentaId,
+      liberadas,
+      cantidad: liberadas.length,
+      mensaje:
+        liberadas.length > 0
+          ? 'Listo. Ahora corré /debug/run-etiquetas-ventas para que las vuelva a bajar y mandar.'
+          : 'No había ninguna etiqueta marcada como generada entre las ventas recientes de esta cuenta.',
+    });
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
   }
