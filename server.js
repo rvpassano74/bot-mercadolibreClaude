@@ -2127,14 +2127,113 @@ async function corridaDiariaEtiquetasYVentas({ forzar = false } = {}) {
   }
 }
 
+// Procesa el export de ventas a Excel (lento, con rate-limit de la API
+// de facturación de Mercado Libre) para las órdenes que ya se habían
+// pedido en la primera pasada (una por cuenta). No manda nada por
+// Telegram todavía - solo arma los datos.
+async function procesarExportVentas(ordenesPorCuenta) {
+  const filasML = [];
+  const filasVentas = [];
+  const filasRevisar = [];
+  const marcasExportPendientes = [];
+  let huboError = false;
+
+  for (const [cuentaId, ordenesPendientes] of Object.entries(ordenesPorCuenta)) {
+    const cuenta = data.cuentas[cuentaId];
+    if (!cuenta) continue;
+    try {
+      const token = await getAccessToken(cuentaId);
+      const itemsCuenta = [];
+      for (const orden of ordenesPendientes) {
+        if (cuenta.filas_export_cargadas.includes(orden.id)) continue;
+        // Pausa chica entre ventas para no pisar el límite de la API
+        // de facturación de Mercado Libre (ver comentario en
+        // axiosGetConReintento).
+        await new Promise((r) => setTimeout(r, 400));
+        try {
+          const filaML = await armarFilaVentaML(cuentaId, orden, token);
+          const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
+          itemsCuenta.push({ filaML, unidadesPorColumna, manual, itemsSinResolver });
+          marcasExportPendientes.push({ cuenta, ordenId: orden.id });
+        } catch (err) {
+          console.error(`Error resolviendo productos del export (orden ${orden.id}):`, err.response?.data || err.message);
+          huboError = true;
+        }
+      }
+
+      // Si una compra se dividió en varias "órdenes" (mismo # de
+      // venta), se juntan acá en una sola fila antes de agregarlas
+      // al Excel - ver combinarFilasPorVenta.
+      const cuentaNombre = cuenta.nombre || cuentaId;
+      for (const { filaML, unidadesPorColumna, manual, itemsSinResolver } of combinarFilasPorVenta(itemsCuenta)) {
+        filasML.push({ ...filaML, cuenta: cuentaNombre });
+        filasVentas.push({
+          fechaHora: filaML.fechaHora,
+          nombre: filaML.nombre,
+          monto: filaML.monto,
+          unidadesPorColumna,
+        });
+        if (manual || filaML.montoExacto === false) {
+          filasRevisar.push({
+            id: filaML.numeroVenta,
+            cuenta: cuentaNombre,
+            fechaHora: filaML.fechaHora,
+            monto: filaML.monto,
+            montoExacto: filaML.montoExacto,
+            itemsSinResolver,
+          });
+        }
+      }
+    } catch (err) {
+      console.error(`Error procesando export de ventas de ${cuenta.nombre}:`, err.response?.data || err.message);
+      huboError = true;
+    }
+  }
+
+  return { filasML, filasVentas, filasRevisar, marcasExportPendientes, huboError };
+}
+
+// Arma el Excel con lo que devolvió procesarExportVentas() y lo manda
+// por Telegram. Marca las órdenes como exportadas solo si el envío
+// sale bien (mismo criterio que la planilla / etiquetas).
+async function armarYMandarExcelVentas(resultado, hoy) {
+  const { filasML, filasVentas, filasRevisar, marcasExportPendientes } = resultado || {};
+  if (!filasVentas?.length && !filasRevisar?.length) return 0;
+  const excelBuffer = await crearExcelVentas(filasML, filasVentas, filasRevisar);
+  const avisoRevisar = filasRevisar.length
+    ? ` ⚠️ ${filasRevisar.length} venta(s) para revisar a mano (producto sin mapear o monto sin confirmar).`
+    : '';
+  await enviarExcelPorTelegram(
+    TELEGRAM_CHAT_ID,
+    excelBuffer,
+    `ventas_${hoy}.xlsx`,
+    `🧾 Ventas del ${hoy} - ${filasVentas.length} fila(s) lista(s) para pegar en tu planilla.${avisoRevisar}`
+  );
+  for (const { cuenta, ordenId } of marcasExportPendientes) {
+    cuenta.filas_export_cargadas.push(ordenId);
+  }
+  await saveData(data);
+  return marcasExportPendientes.length;
+}
+
 async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
   const buffersEtiquetas = [];
   const filasPlanilla = [];
   const marcasPendientes = []; // { cuenta, ordenId } - se confirman solo si la planilla se escribe bien
-  const filasML = []; // filas para la hoja "VentasSkin ML" del Excel del día
-  const filasVentas = []; // filas para la hoja "VentasSkin" (Fecha, Nombre, productos, Monto)
-  const filasRevisar = []; // ventas con algo que revisar a mano (producto sin mapear o monto sin confirmar)
-  const marcasExportPendientes = []; // { cuenta, ordenId } - se confirman solo si el Excel se manda bien
+  // El export de ventas a Excel es LENTO a propósito (respeta un
+  // límite bajo de la API de facturación de Mercado Libre, con pausas
+  // y reintentos de hasta 1 minuto). Las etiquetas, en cambio, son
+  // urgentes: hay que imprimirlas y despachar los paquetes en
+  // horario. La idea es mandar ambos juntos cuando se pueda (el
+  // volumen diario habitual tarda unos minutos nomás), PERO las
+  // etiquetas nunca esperan más de TIEMPO_MAXIMO_ESPERA_EXPORT_MS: si
+  // el export se demora de más (muchas ventas ese día, muchos
+  // reintentos por rate-limit de Mercado Libre), las etiquetas se
+  // mandan igual y el Excel llega aparte apenas termine. Así no se
+  // repite lo de hoy, que no llegó ni una cosa ni la otra.
+  // "ordenesPorCuenta" guarda las órdenes ya pedidas en la primera
+  // pasada, para no volver a pedirlas al procesar el export.
+  const ordenesPorCuenta = {};
   let huboError = false;
 
   for (const cuentaId of Object.keys(data.cuentas || {})) {
@@ -2185,55 +2284,11 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
         }
       }
 
-      // --- Filas nuevas para el export a Excel (feature nuevo, ---
-      // --- independiente de la planilla de Google Sheets) ---
-      // Igual que con la planilla, no se marca la orden como "ya
-      // exportada" acá: se marca más abajo, solo si el Excel se llega
-      // a mandar bien por Telegram. Si falla el envío, estas ventas
-      // quedan pendientes y se reintentan solas en la corrida
-      // siguiente.
+      // El export a Excel (lento, con rate-limit) se procesa DESPUÉS
+      // de mandar las etiquetas - acá solo se guardan las órdenes de
+      // esta cuenta para no volver a pedirlas en esa segunda pasada.
       if (EXPORT_VENTAS_ACTIVA) {
-        const itemsCuenta = [];
-        for (const orden of ordenesPendientes) {
-          if (cuenta.filas_export_cargadas.includes(orden.id)) continue;
-          // Pausa chica entre ventas para no pisar el límite de la API
-          // de facturación de Mercado Libre (ver comentario en
-          // axiosGetConReintento).
-          await new Promise((r) => setTimeout(r, 400));
-          try {
-            const filaML = await armarFilaVentaML(cuentaId, orden, token);
-            const { unidadesPorColumna, manual, itemsSinResolver } = resolverProductosOrden(orden);
-            itemsCuenta.push({ filaML, unidadesPorColumna, manual, itemsSinResolver });
-            marcasExportPendientes.push({ cuenta, ordenId: orden.id });
-          } catch (err) {
-            console.error(`Error resolviendo productos del export (orden ${orden.id}):`, err.response?.data || err.message);
-            huboError = true;
-          }
-        }
-
-        // Si una compra se dividió en varias "órdenes" (mismo # de
-        // venta), se juntan acá en una sola fila antes de agregarlas
-        // al Excel - ver combinarFilasPorVenta.
-        const cuentaNombre = cuenta.nombre || cuentaId;
-        for (const { filaML, unidadesPorColumna, manual, itemsSinResolver } of combinarFilasPorVenta(itemsCuenta)) {
-          filasML.push({ ...filaML, cuenta: cuentaNombre });
-          filasVentas.push({
-            fechaHora: filaML.fechaHora,
-            nombre: filaML.nombre,
-            monto: filaML.monto,
-            unidadesPorColumna,
-          });
-          if (manual || filaML.montoExacto === false) {
-            filasRevisar.push({
-              id: filaML.numeroVenta,
-              cuenta: cuentaNombre,
-              fechaHora: filaML.fechaHora,
-              monto: filaML.monto,
-              montoExacto: filaML.montoExacto,
-              itemsSinResolver,
-            });
-          }
-        }
+        ordenesPorCuenta[cuentaId] = ordenesPendientes;
       }
 
       // --- Etiquetas nuevas para imprimir ---
@@ -2311,35 +2366,32 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
     }
   }
 
-  // Generar y mandar por Telegram el Excel de ventas del día (para
-  // pegar a mano en la planilla local). Solo si el envío sale bien
-  // marcamos las órdenes como "ya exportadas" - mismo criterio que la
-  // planilla de Google Sheets, para no perder ventas si falla el envío.
-  let ventasExportadas = 0;
-  if (EXPORT_VENTAS_ACTIVA && (filasVentas.length || filasRevisar.length)) {
-    try {
-      const excelBuffer = await crearExcelVentas(filasML, filasVentas, filasRevisar);
-      const avisoRevisar = filasRevisar.length
-        ? ` ⚠️ ${filasRevisar.length} venta(s) para revisar a mano (producto sin mapear o monto sin confirmar).`
-        : '';
-      await enviarExcelPorTelegram(
-        TELEGRAM_CHAT_ID,
-        excelBuffer,
-        `ventas_${hoy}.xlsx`,
-        `🧾 Ventas del ${hoy} - ${filasVentas.length} fila(s) lista(s) para pegar en tu planilla.${avisoRevisar}`
-      );
-      for (const { cuenta, ordenId } of marcasExportPendientes) {
-        cuenta.filas_export_cargadas.push(ordenId);
-      }
-      ventasExportadas = marcasExportPendientes.length;
-      await saveData(data);
-    } catch (err) {
-      console.error('Error generando/mandando el Excel de ventas:', err.response?.data || err.message);
-      huboError = true;
-    }
-  }
+  // Arrancamos el export de ventas YA (en paralelo, sin esperarlo
+  // todavía) para que, si termina a tiempo, las etiquetas y el Excel
+  // se manden juntos. TIEMPO_MAXIMO_ESPERA_EXPORT_MS es el límite: si
+  // el export no terminó para entonces, las etiquetas se mandan igual
+  // (nunca esperan de más) y el Excel llega aparte apenas esté listo.
+  const TIEMPO_MAXIMO_ESPERA_EXPORT_MS = 12 * 60 * 1000; // 12 minutos
+  const exportPromise =
+    EXPORT_VENTAS_ACTIVA && Object.keys(ordenesPorCuenta).length
+      ? procesarExportVentas(ordenesPorCuenta).catch((err) => {
+          console.error('Error inesperado procesando el export de ventas:', err.response?.data || err.message);
+          return { filasML: [], filasVentas: [], filasRevisar: [], marcasExportPendientes: [], huboError: true };
+        })
+      : Promise.resolve(null);
 
-  // Combinar y mandar las etiquetas por Telegram
+  let resultadoExport = null;
+  let exportListoATiempo = false;
+  await Promise.race([
+    exportPromise.then((r) => {
+      resultadoExport = r;
+      exportListoATiempo = true;
+    }),
+    new Promise((resolve) => setTimeout(resolve, TIEMPO_MAXIMO_ESPERA_EXPORT_MS)),
+  ]);
+
+  // Combinar y mandar las etiquetas por Telegram - nunca esperan más
+  // de lo de arriba, sin importar cómo venga el export.
   let pdfEnviado = false;
   if (buffersEtiquetas.length) {
     try {
@@ -2371,6 +2423,36 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
     data.etiquetas_ventas_aviso_vacio_fecha = hoy;
   }
 
+  // Generar y mandar por Telegram el Excel de ventas del día (para
+  // pegar a mano en la planilla local). Solo si el envío sale bien
+  // marcamos las órdenes como "ya exportadas" - mismo criterio que la
+  // planilla de Google Sheets, para no perder ventas si falla el envío.
+  let ventasExportadas = 0;
+  if (exportListoATiempo) {
+    // El export terminó dentro del tiempo de espera: se manda el
+    // Excel ahora, junto con las etiquetas de arriba.
+    if (resultadoExport?.huboError) huboError = true;
+    if (resultadoExport) {
+      try {
+        ventasExportadas = await armarYMandarExcelVentas(resultadoExport, hoy);
+      } catch (err) {
+        console.error('Error generando/mandando el Excel de ventas:', err.response?.data || err.message);
+        huboError = true;
+      }
+    }
+  } else if (EXPORT_VENTAS_ACTIVA && Object.keys(ordenesPorCuenta).length) {
+    // El export se está demorando más de lo normal (más ventas que lo
+    // habitual, o muchos reintentos por rate-limit de Mercado Libre).
+    // No vamos a retener las etiquetas por eso - ya se mandaron arriba
+    // - así que lo dejamos terminar solo en segundo plano y el Excel
+    // se manda aparte apenas esté listo.
+    exportPromise
+      .then((resultado) => armarYMandarExcelVentas(resultado, hoy))
+      .catch((err) => {
+        console.error('Error generando/mandando el Excel de ventas (demorado):', err.response?.data || err.message);
+      });
+  }
+
   if (!huboError) data.etiquetas_ventas_ultima_fecha = hoy;
   await saveData(data);
 
@@ -2381,7 +2463,7 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
     etiquetas: buffersEtiquetas.length,
     pdfEnviado,
     ventasExportadas,
-    ventasParaRevisar: filasRevisar.length,
+    ventasParaRevisar: resultadoExport?.filasRevisar?.length || 0,
   };
 }
 
