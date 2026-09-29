@@ -1148,21 +1148,9 @@ const {
   GOOGLE_SHEET_ID,
   GOOGLE_SHEET_TAB = 'Hoja 1',
   HORA_ETIQUETAS_VENTAS = '09:00',
-  DIAS_VENTANA_ETIQUETAS_VENTAS = '1',
   PLANILLA_VENTAS_ACTIVA,
   EXPORT_VENTAS_ACTIVA: EXPORT_VENTAS_ACTIVA_RAW,
 } = process.env;
-
-// Ventana de "cuántos días para atrás" se considera una venta
-// reciente (no calendario - son últimas 24hs x VENTANA_DIAS desde
-// ahora). Antes eran 3 días "por las dudas", pero eso hacía que
-// cualquier reproceso (como liberar etiquetas trabadas) trajera de
-// vuelta un montón de ventas viejas ya resueltas a mano, e inflaba
-// mucho el export de ventas (que es lento por el límite de Mercado
-// Libre). Con 1 día alcanza de sobra para no perder una venta que
-// llegó tarde a la noche, y el bot igual nunca reprocesa una venta ya
-// marcada como hecha, sea cual sea la ventana.
-const VENTANA_DIAS = Number(DIAS_VENTANA_ETIQUETAS_VENTAS) || 1;
 
 // Interruptor para pausar SOLO la carga automática a la planilla de
 // Google Sheets, sin tocar nada de las etiquetas (que siguen andando
@@ -1874,12 +1862,28 @@ function combinarFilasPorVenta(items) {
   return combinadas;
 }
 
-// Ventas de hasta VENTANA_DIAS días atrás (para agarrar las que
-// llegaron tarde ayer), pero sin traer historial viejo de semanas.
+// Ventana FIJA (no relativa a "ahora"): desde las 12:00 del día
+// anterior hasta las 09:00 de hoy, hora Argentina - así coincide
+// exactamente con lo que el usuario maneja a mano (las ventas de 9 a
+// 12 las imprime/anota él directamente en Mercado Libre) y con el
+// horario en que corre el informe diario (HORA_ETIQUETAS_VENTAS).
+// Antes era una ventana relativa ("últimas 24hs desde ahora mismo"),
+// lo que corría el límite si el chequeo se disparaba en otro horario
+// (por ejemplo, una corrida manual a la tarde). Ahora el límite
+// siempre es el mismo horario de reloj, sea cual sea la hora real en
+// que se llame a esta función.
+function limiteVentanaExport() {
+  const hoy = fechaHoyAR(); // "YYYY-MM-DD" en hora Argentina
+  const [anio, mes, dia] = hoy.split('-').map(Number);
+  // Medianoche de HOY en Argentina = 03:00 UTC del mismo día (Argentina
+  // es UTC-3 todo el año, sin horario de verano). Restando 12hs se
+  // llega al mediodía de AYER en Argentina.
+  const medianocheHoyUTC = Date.UTC(anio, mes - 1, dia, 3, 0, 0);
+  return new Date(medianocheHoyUTC - 12 * 60 * 60 * 1000);
+}
+
 function esVentaReciente(fechaISO) {
-  const limite = new Date();
-  limite.setDate(limite.getDate() - VENTANA_DIAS);
-  return new Date(fechaISO) >= limite;
+  return new Date(fechaISO) >= limiteVentanaExport();
 }
 
 // ---------------------------------------------------------------------
@@ -2346,10 +2350,9 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
         params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 50 },
         headers: { Authorization: `Bearer ${token}` },
       });
-      // Ya no filtramos "solo las ventas de HOY" (para no perder una
-      // venta que llegó tarde a la noche), pero tampoco traemos
-      // historial viejo sin límite: nos quedamos con los últimos
-      // VENTANA_DIAS días. Lo que evita repetir una misma venta ya
+      // Nos quedamos con las ventas de la ventana fija (12:00 de ayer
+      // a 09:00 de hoy - ver esVentaReciente), no con historial viejo
+      // sin límite. Lo que evita repetir una misma venta ya
       // procesada es que su ID está guardado en
       // filas_planilla_cargadas / etiquetas_generadas, no la fecha.
       const ordenesPendientes = (resp.results || []).filter((o) => esVentaReciente(o.date_created));
@@ -2707,8 +2710,8 @@ app.get('/debug/liberar-etiquetas', async (req, res) => {
 // (no marca ninguna orden como "ya exportada", así se puede correr
 // las veces que haga falta mientras se revisa que el archivo salga
 // bien, antes de prender EXPORT_VENTAS_ACTIVA=si en Render). Junta las
-// ventas pagadas de los últimos VENTANA_DIAS días de las 3 cuentas,
-// arma el Excel y lo manda por Telegram.
+// ventas pagadas dentro de la ventana fija (12:00 de ayer a 09:00 de
+// hoy) de las 3 cuentas, arma el Excel y lo manda por Telegram.
 // Guarda el resultado de la última prueba en memoria para poder
 // consultarlo con /debug/ultimo-test-excel-ventas sin depender de que
 // la conexión HTTP original siga abierta (con muchas ventas, el
