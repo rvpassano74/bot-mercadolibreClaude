@@ -1862,6 +1862,22 @@ function combinarFilasPorVenta(items) {
   return combinadas;
 }
 
+// Día de la semana de "hoy" en Argentina: 0=domingo ... 6=sábado. Se
+// calcula a partir de la fecha calendario (no depende de la hora ni
+// del huso horario del servidor).
+function diaSemanaHoyAR() {
+  const hoy = fechaHoyAR(); // "YYYY-MM-DD" en hora Argentina
+  const [anio, mes, dia] = hoy.split('-').map(Number);
+  return new Date(Date.UTC(anio, mes - 1, dia)).getUTCDay();
+}
+
+// Sábado y domingo el informe diario (etiquetas + Excel) no corre -
+// se acumula todo para el lunes (ver limiteVentanaExport).
+function esFinDeSemanaAR() {
+  const d = diaSemanaHoyAR();
+  return d === 0 || d === 6;
+}
+
 // Ventana FIJA (no relativa a "ahora"): desde las 12:00 del día
 // anterior hasta las 09:00 de hoy, hora Argentina - así coincide
 // exactamente con lo que el usuario maneja a mano (las ventas de 9 a
@@ -1872,14 +1888,19 @@ function combinarFilasPorVenta(items) {
 // (por ejemplo, una corrida manual a la tarde). Ahora el límite
 // siempre es el mismo horario de reloj, sea cual sea la hora real en
 // que se llame a esta función.
+// Excepción: el lunes, como sábado y domingo no corre nada (ver
+// esFinDeSemanaAR), la ventana arranca el viernes a las 12:00 - así
+// el informe del lunes junta de una vez lo del viernes desde el
+// mediodía + todo el sábado y domingo.
 function limiteVentanaExport() {
   const hoy = fechaHoyAR(); // "YYYY-MM-DD" en hora Argentina
   const [anio, mes, dia] = hoy.split('-').map(Number);
+  const diasHaciaAtras = diaSemanaHoyAR() === 1 ? 3 : 1; // lunes: viernes (3 días atrás); resto: ayer
   // Medianoche de HOY en Argentina = 03:00 UTC del mismo día (Argentina
-  // es UTC-3 todo el año, sin horario de verano). Restando 12hs se
-  // llega al mediodía de AYER en Argentina.
+  // es UTC-3 todo el año, sin horario de verano).
   const medianocheHoyUTC = Date.UTC(anio, mes - 1, dia, 3, 0, 0);
-  return new Date(medianocheHoyUTC - 12 * 60 * 60 * 1000);
+  const offsetMs = diasHaciaAtras * 24 * 60 * 60 * 1000 - 12 * 60 * 60 * 1000;
+  return new Date(medianocheHoyUTC - offsetMs);
 }
 
 function esVentaReciente(fechaISO) {
@@ -2596,8 +2617,13 @@ async function ejecutarCorridaDiariaEtiquetasYVentas({ forzar, hoy }) {
 }
 
 // Se llama cada 1 minuto (enganchado desde revisarTodo). Solo actúa
-// una vez que pasó la hora configurada, y una sola vez por día.
+// una vez que pasó la hora configurada, una sola vez por día, y NUNCA
+// sábado ni domingo (esos dos días no se manda nada - ver
+// esFinDeSemanaAR y limiteVentanaExport). Esto solo frena el chequeo
+// AUTOMÁTICO: una corrida forzada a mano desde /debug/run-etiquetas-ventas
+// sigue funcionando cualquier día, por si hace falta.
 async function revisarEtiquetasYVentas() {
+  if (esFinDeSemanaAR()) return;
   if (horaAhoraAR() < HORA_ETIQUETAS_VENTAS) return;
   try {
     const resultado = await corridaDiariaEtiquetasYVentas();
