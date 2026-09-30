@@ -788,13 +788,37 @@ async function revisarResumenDiario() {
   console.log('📊 Resumen diario enviado.');
 }
 
+// El setInterval de más abajo dispara revisarTodo() cada 60 segundos SIN
+// esperar a que termine la corrida anterior. Mientras corren las etiquetas
+// y el Excel de ventas (revisarEtiquetasYVentas, que puede tardar varios
+// minutos por el tope de 12 min del export) el tick de cada minuto seguía
+// disparando revisarTodo() de nuevo por encima, y como revisarVentasNuevas()
+// no tenía ningún candado, dos corridas superpuestas podían leer
+// cuenta.ventas_notificadas ANTES de que la otra guardara su avance, ver la
+// misma venta como "nueva" en las dos, y avisarla y contarla dos veces en
+// el resumen (Flex/Normal) — esto explica los descuadres del resumen de
+// las 12:00 que coinciden con el horario en que corren las etiquetas.
+// Con este candado, si todavía hay una corrida de revisarTodo en curso,
+// el tick siguiente se saltea entero en vez de superponerse.
+let revisarTodoEnCurso = false;
 async function revisarTodo() {
-  await revisarPreguntasNuevas();
-  await revisarVentasNuevas();
-  await revisarReclamosNuevos();
-  await revisarStockBajo();
-  await revisarResumenDiario();
-  await revisarEtiquetasYVentas();
+  if (revisarTodoEnCurso) {
+    console.log('⏭️ revisarTodo: la corrida anterior todavía no terminó, salteo este tick.');
+    return;
+  }
+  revisarTodoEnCurso = true;
+  try {
+    await revisarPreguntasNuevas();
+    await revisarVentasNuevas();
+    await revisarReclamosNuevos();
+    await revisarStockBajo();
+    await revisarResumenDiario();
+    await revisarEtiquetasYVentas();
+  } catch (err) {
+    console.error('Error inesperado en revisarTodo:', err.response?.data || err.message);
+  } finally {
+    revisarTodoEnCurso = false;
+  }
 }
 
 // =====================================================================
