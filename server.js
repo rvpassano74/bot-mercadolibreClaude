@@ -967,12 +967,23 @@ app.get('/debug/tipos-envio', async (req, res) => {
           // no lo encuentra, probamos como pack_id.
           if (err.response?.status !== 404) throw err;
           buscadoPor = 'pack_id';
-          const { data: resp2 } = await axios.get('https://api.mercadolibre.com/orders/search', {
-            params: { seller: cuentaId, 'pack_id': ordenId },
+          // El filtro pack_id de orders/search no funciona como filtro real
+          // (devuelve cualquier cosa, confirmado con pruebas). La forma
+          // correcta de resolver un pack_id es /packs/{pack_id}, que trae
+          // los order_ids reales que componen ese pack.
+          const { data: pack } = await axios.get(`https://api.mercadolibre.com/packs/${ordenId}`, {
             headers: { Authorization: `Bearer ${token}` },
           });
-          orden = (resp2.results || [])[0] || null;
-          if (!orden) throw err; // ni como order_id ni como pack_id - no existe
+          const orderIdsDelPack = Array.isArray(pack?.orders)
+            ? pack.orders.map((o) => o.id).filter(Boolean)
+            : Array.isArray(pack?.order_ids)
+            ? pack.order_ids
+            : [];
+          if (!orderIdsDelPack.length) throw err; // ni como order_id ni como pack_id - no existe
+          const resp3 = await axios.get(`https://api.mercadolibre.com/orders/${orderIdsDelPack[0]}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          orden = resp3.data;
         }
         const shippingId = orden.shipping?.id;
         let logisticType = null;
