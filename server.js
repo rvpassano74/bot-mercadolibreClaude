@@ -952,9 +952,28 @@ app.get('/debug/tipos-envio', async (req, res) => {
     const resultados = [];
     for (const ordenId of ids) {
       try {
-        const { data: orden } = await axios.get(`https://api.mercadolibre.com/orders/${ordenId}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        let orden = null;
+        let buscadoPor = 'order_id';
+        try {
+          const resp = await axios.get(`https://api.mercadolibre.com/orders/${ordenId}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          orden = resp.data;
+        } catch (err) {
+          // El "ID" que se ve en el Excel/planilla (numeroVenta) es en
+          // realidad el pack_id cuando la venta tiene uno (ver
+          // armarFilaVentaML: numeroVenta = orden.pack_id || orden.id),
+          // que es un número DISTINTO al order_id. Si /orders/{id}
+          // no lo encuentra, probamos como pack_id.
+          if (err.response?.status !== 404) throw err;
+          buscadoPor = 'pack_id';
+          const { data: resp2 } = await axios.get('https://api.mercadolibre.com/orders/search', {
+            params: { seller: cuentaId, 'pack_id': ordenId },
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          orden = (resp2.results || [])[0] || null;
+          if (!orden) throw err; // ni como order_id ni como pack_id - no existe
+        }
         const shippingId = orden.shipping?.id;
         let logisticType = null;
         if (shippingId) {
@@ -965,10 +984,13 @@ app.get('/debug/tipos-envio', async (req, res) => {
         }
         resultados.push({
           ordenId,
+          buscadoPor,
+          orderIdReal: orden.id,
+          packId: orden.pack_id,
           shippingId,
           logisticType,
           tipoEnvio: !shippingId ? 'Sin envío' : logisticType === 'self_service' ? 'Flex' : 'Normal',
-          yaNotificada: (data.cuentas[cuentaId]?.ventas_notificadas || []).includes(Number(ordenId)),
+          yaNotificada: (data.cuentas[cuentaId]?.ventas_notificadas || []).includes(Number(orden.id)),
         });
       } catch (err) {
         resultados.push({ ordenId, error: err.response?.data || err.message });
