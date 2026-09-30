@@ -934,6 +934,65 @@ app.get('/debug/simulate-question', async (req, res) => {
   }
 });
 
+// Solo LEE - no manda Telegram ni toca resumen_periodo ni ningún
+// estado guardado. Para diagnosticar clasificaciones Flex/Normal
+// puntuales sin generar más ruido (a diferencia de /debug/simulate-order,
+// que sí manda un mensaje real y suma al resumen).
+// ?cuenta=ID&ids=id1,id2,id3
+app.get('/debug/tipos-envio', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const ids = String(req.query.ids || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!ids.length) return res.status(400).json({ error: 'Pasá ?ids=id1,id2,id3 (IDs de orden de Mercado Libre).' });
+  try {
+    const token = await getAccessToken(cuentaId);
+    const resultados = [];
+    for (const ordenId of ids) {
+      try {
+        const { data: orden } = await axios.get(`https://api.mercadolibre.com/orders/${ordenId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const shippingId = orden.shipping?.id;
+        let logisticType = null;
+        if (shippingId) {
+          const { data: envio } = await axios.get(`https://api.mercadolibre.com/shipments/${shippingId}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          logisticType = envio.logistic_type;
+        }
+        resultados.push({
+          ordenId,
+          shippingId,
+          logisticType,
+          tipoEnvio: !shippingId ? 'Sin envío' : logisticType === 'self_service' ? 'Flex' : 'Normal',
+          yaNotificada: (data.cuentas[cuentaId]?.ventas_notificadas || []).includes(Number(ordenId)),
+        });
+      } catch (err) {
+        resultados.push({ ordenId, error: err.response?.data || err.message });
+      }
+    }
+    res.json({ cuenta: data.cuentas[cuentaId]?.nombre || cuentaId, resultados });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// Solo LEE - cuenta cuántas veces aparece cada ID en ventas_notificadas
+// (para detectar si el array tiene IDs literalmente duplicados, lo
+// que confirmaría un doble procesamiento real).
+app.get('/debug/duplicados-notificadas', (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const lista = data.cuentas[cuentaId]?.ventas_notificadas || [];
+  const conteo = {};
+  for (const id of lista) conteo[id] = (conteo[id] || 0) + 1;
+  const duplicados = Object.entries(conteo).filter(([, n]) => n > 1);
+  res.json({ cuenta: data.cuentas[cuentaId]?.nombre || cuentaId, totalEnLista: lista.length, duplicados });
+});
+
 app.get('/debug/list-orders', async (req, res) => {
   const { id: cuentaId, error } = resolverCuentaId(req);
   if (error) return res.status(400).json({ error });
