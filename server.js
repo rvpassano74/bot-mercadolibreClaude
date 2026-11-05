@@ -1037,6 +1037,62 @@ app.get('/debug/tipos-envio', async (req, res) => {
   }
 });
 
+// Solo LEE - para un pack_id (el "ID" que se ve en la planilla), muestra
+// TODOS los order_id reales que contiene y el tipo de envío de cada uno.
+// Un pack con varios order_id es 1 sola fila en la planilla pero puede
+// ser varios envíos distintos para Mercado Libre / el resumen.
+// ?cuenta=ID&pack_id=XXXX
+app.get('/debug/pack-detalle', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const packId = String(req.query.pack_id || '').trim();
+  if (!packId) return res.status(400).json({ error: 'Pasá ?pack_id=XXXX.' });
+  try {
+    const token = await getAccessToken(cuentaId);
+    const { data: pack } = await axios.get(`https://api.mercadolibre.com/packs/${packId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const orderIdsDelPack = Array.isArray(pack?.orders)
+      ? pack.orders.map((o) => o.id).filter(Boolean)
+      : Array.isArray(pack?.order_ids)
+      ? pack.order_ids
+      : [];
+    const detalle = [];
+    for (const ordenId of orderIdsDelPack) {
+      try {
+        const { data: orden } = await axios.get(`https://api.mercadolibre.com/orders/${ordenId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const shippingId = orden.shipping?.id;
+        let logisticType = null;
+        if (shippingId) {
+          const { data: envio } = await axios.get(`https://api.mercadolibre.com/shipments/${shippingId}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          logisticType = envio.logistic_type;
+        }
+        detalle.push({
+          orderId: orden.id,
+          shippingId,
+          tipoEnvio: !shippingId ? 'Sin envío' : logisticType === 'self_service' ? 'Flex' : 'Normal',
+          total: orden.total_amount,
+          yaNotificada: (data.cuentas[cuentaId]?.ventas_notificadas || []).includes(Number(orden.id)),
+        });
+      } catch (err) {
+        detalle.push({ orderId: ordenId, error: err.response?.data || err.message });
+      }
+    }
+    res.json({
+      cuenta: data.cuentas[cuentaId]?.nombre || cuentaId,
+      packId,
+      cantidadOrdenesEnElPack: orderIdsDelPack.length,
+      detalle,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 // Solo LEE - cuenta cuántas veces aparece cada ID en ventas_notificadas
 // (para detectar si el array tiene IDs literalmente duplicados, lo
 // que confirmaría un doble procesamiento real).
@@ -2790,6 +2846,60 @@ app.get('/debug/estado-corrida', (req, res) => {
     ultimaCorrida: ultimoResultadoCorridaDiaria,
     cuentas,
   });
+});
+
+// Solo LEE - repite EXACTAMENTE el mismo filtro que usa la corrida real
+// (orders/search -> ventana fija -> ¿ya impresa? -> ¿ya en
+// etiquetas_generadas?) para una cuenta puntual, mostrando por qué cada
+// orden entró o no. Para diagnosticar sin disparar ninguna corrida ni
+// mandar nada a Telegram.
+app.get('/debug/candidatos-etiquetas', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  try {
+    const cuenta = data.cuentas[cuentaId];
+    const token = await getAccessToken(cuentaId);
+    const { data: resp } = await axios.get('https://api.mercadolibre.com/orders/search', {
+      params: { seller: cuentaId, 'order.status': 'paid', sort: 'date_desc', limit: 50 },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const limite = limiteVentanaExport();
+    const resultados = [];
+    for (const orden of resp.results || []) {
+      const enVentana = esVentaReciente(orden.date_created);
+      const shipmentId = orden.shipping?.id || null;
+      const yaGenerada = shipmentId ? (cuenta.etiquetas_generadas || []).includes(shipmentId) : null;
+      let substatus = null;
+      if (enVentana && shipmentId && !yaGenerada) {
+        try {
+          const { data: envio } = await axios.get(`https://api.mercadolibre.com/shipments/${shipmentId}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          substatus = envio.substatus;
+        } catch (err) {
+          substatus = `error: ${err.response?.data?.message || err.message}`;
+        }
+      }
+      resultados.push({
+        ordenId: orden.id,
+        fecha: orden.date_created,
+        enVentana,
+        shipmentId,
+        yaGenerada,
+        substatus,
+        seriaCandidata: enVentana && !!shipmentId && !yaGenerada && substatus !== 'printed',
+      });
+    }
+    res.json({
+      cuenta: cuenta?.nombre || cuentaId,
+      ahora: new Date().toISOString(),
+      limiteVentanaExport: limite.toISOString(),
+      totalOrdenesTraidas: (resp.results || []).length,
+      resultados,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
 });
 
 // Rescate puntual para el bug de hoy (ya arreglado en el código, esto
