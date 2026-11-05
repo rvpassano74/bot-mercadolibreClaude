@@ -2848,6 +2848,37 @@ app.get('/debug/estado-corrida', (req, res) => {
   });
 });
 
+// Solo LEE - detalle crudo de UN envío puntual tal cual lo devuelve
+// Mercado Libre (status, substatus, logistic_type, etc.), para
+// confirmar con el dato real por qué una etiqueta figura como "ya
+// impresa" (substatus "printed") sin que el vendedor la haya impreso.
+// ?cuenta=ID&shipment_id=XXXX
+app.get('/debug/shipment-detalle', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const shipmentId = String(req.query.shipment_id || '').trim();
+  if (!shipmentId) return res.status(400).json({ error: 'Pasá ?shipment_id=XXXX.' });
+  try {
+    const token = await getAccessToken(cuentaId);
+    const { data: envio } = await axios.get(`https://api.mercadolibre.com/shipments/${shipmentId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    res.json({
+      cuenta: data.cuentas[cuentaId]?.nombre || cuentaId,
+      shipmentId,
+      status: envio.status,
+      substatus: envio.substatus,
+      logistic_type: envio.logistic_type,
+      date_created: envio.date_created,
+      last_updated: envio.last_updated,
+      tracking_method: envio.tracking_method,
+      shipping_option: envio.shipping_option?.name,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 // Solo LEE - repite EXACTAMENTE el mismo filtro que usa la corrida real
 // (orders/search -> ventana fija -> ¿ya impresa? -> ¿ya en
 // etiquetas_generadas?) para una cuenta puntual, mostrando por qué cada
