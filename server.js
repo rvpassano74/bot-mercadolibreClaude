@@ -1110,6 +1110,11 @@ async function procesarFilaPromo(cuentaId, fila, modo) {
       return { ...out, recibiria: '', estado: `No da: con el descuento mínimo (5%) recibís ${pesos(recibis5)}, menos de ${pesos(quiero)}. Habría que subir el precio de lista.` };
     }
     const r = await precioParaRecibir(cuentaId, { ...item }, quiero);
+    // Al redondear para arriba puede pasarse del máximo por centavos: el precio máximo ya alcanza (recibis5 >= quiero).
+    if (r.precio > precio5) {
+      r.precio = Math.floor(precio5);
+      r.recibe = await calcularRecibis(cuentaId, item, r.precio);
+    }
     if (r.precio !== precioQuiero) out.escribirPrecioQuiero = true;
     precioQuiero = r.precio;
     recibiria = r.recibe;
