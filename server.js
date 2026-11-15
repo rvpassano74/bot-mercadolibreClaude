@@ -990,7 +990,13 @@ async function mlGet(cuentaId, path, intentos = 5) {
 
 const redondear2 = (x) => Math.round(x * 100) / 100;
 const pesos = (x) => `$${Number(x).toLocaleString('es-AR', { maximumFractionDigits: 2 })}`;
-const fechaDDMMYYYY = (iso) => (iso ? iso.slice(0, 10).split('-').reverse().join('/') : '');
+// Las fechas en UTC ("...Z") se pasan a hora argentina; las demás ya vienen en hora local.
+const fechaDDMMYYYY = (iso) => {
+  if (!iso) return '';
+  const ymd = /Z$/i.test(iso) ? new Intl.DateTimeFormat('en-CA', { timeZone: ZONA_HORARIA }).format(new Date(iso)) : iso.slice(0, 10);
+  return ymd.split('-').reverse().join('/');
+};
+const finCampañaCache = new Map(); // id de campaña -> fecha de fin (no viene en la promo de cada publicación)
 
 // Lo mismo que muestra ML en "Recibís": precio - cargo por vender - envío
 // gratis (si lo ofrecés). Verificado al centavo contra la pantalla de ML.
@@ -1061,9 +1067,27 @@ async function procesarFilaPromo(cuentaId, fila, modo) {
   const nombrePromo = vigente
     ? vigente.type === 'PRICE_DISCOUNT' ? NOMBRE_TIPO_PROMO.PRICE_DISCOUNT : `${NOMBRE_TIPO_PROMO[vigente.type] || vigente.type}${vigente.name ? ': ' + vigente.name : ''}`
     : 'Sin promoción';
-  const vence = fechaDDMMYYYY(vigente?.finish_date);
+  let finVigente = vigente?.finish_date;
+  if (vigente && !finVigente && vigente.id) {
+    if (!finCampañaCache.has(vigente.id)) {
+      const campaña = await mlGet(cuentaId, `/seller-promotions/promotions/${vigente.id}?promotion_type=${vigente.type}&app_version=v2`).catch(() => ({}));
+      finCampañaCache.set(vigente.id, campaña.finish_date || '');
+    }
+    finVigente = finCampañaCache.get(vigente.id);
+  }
+  const vence = fechaDDMMYYYY(finVigente);
 
-  out.info = [lista, nombrePromo, vigente ? vigente.price : '', await calcularRecibis(cuentaId, item, vigente ? vigente.price : lista), vence,
+  // En las ofertas compartidas (SMART) MercadoLibre paga parte del descuento y
+  // te lo descuenta del cargo por vender. ML solo informa los porcentajes
+  // redondeados, así que el monto es aproximado (error de pocos pesos).
+  let aporteML = 0;
+  if (vigente?.meli_percentage > 0) {
+    aporteML = redondear2((vigente.original_price - vigente.price) * vigente.meli_percentage /
+      (vigente.meli_percentage + (vigente.seller_percentage || 0)));
+  }
+
+  out.info = [lista, nombrePromo, vigente ? vigente.price : '',
+    redondear2((await calcularRecibis(cuentaId, item, vigente ? vigente.price : lista)) + aporteML), vence,
     precio5, await calcularRecibis(cuentaId, item, precio5)];
   const recibis5 = out.info[6];
 
@@ -1093,7 +1117,8 @@ async function procesarFilaPromo(cuentaId, fila, modo) {
   }
 
   if (vigente && vigente.type !== 'PRICE_DISCOUNT') {
-    return { ...out, estado: `En ${nombrePromo}${vence ? ' hasta ' + vence : ''}. No se toca; ${precioQuiero ? 'tu precio se aplica cuando termine' : 'cargá un precio para cuando termine'}.` };
+    const notaAporte = aporteML ? ` MercadoLibre pone aprox. ${pesos(aporteML)} del descuento (ya sumado en Recibís).` : '';
+    return { ...out, estado: `En ${nombrePromo}${vence ? ' hasta ' + vence : ''}. No se toca; ${precioQuiero ? 'tu precio se aplica cuando termine' : 'cargá un precio para cuando termine'}.${notaAporte}` };
   }
   if (vigente) {
     if (!precioQuiero) return { ...out, estado: `Descuento vigente hasta ${vence}. Sin precio cargado: al vencer no se renueva.` };
