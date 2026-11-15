@@ -1129,13 +1129,18 @@ async function revisarPromociones({ modo = PROMO_MODO, solo = null } = {}) {
         spreadsheetId: PROMO_SHEET_ID, range: `'${pestaña}'!A2:M`, valueRenderOption: 'UNFORMATTED_VALUE',
       });
       const filas = valores.values || [];
-      // A qué cuenta corresponde la pestaña: la dueña de su primera publicación.
+      // A qué cuenta corresponde la pestaña: la dueña de su primera
+      // publicación (ML solo deja ver la publicación con el token de su dueña).
       const primerId = filas.map((f) => String(f[PCOL.id] || '').trim()).find((x) => /^MLA\d+$/.test(x));
-      const cualquierCuenta = Object.keys(data.cuentas || {})[0];
-      if (!primerId || !cualquierCuenta) continue;
-      const cuentaId = String((await mlGet(cualquierCuenta, `/items/${primerId}?attributes=seller_id`)).seller_id);
-      if (!data.cuentas[cuentaId]) {
-        resumen.errores.push(`${pestaña}: la cuenta ${cuentaId} no está conectada al bot`);
+      if (!primerId) continue;
+      let cuentaId = null;
+      for (const c of Object.keys(data.cuentas || {})) {
+        try {
+          if (String((await mlGet(c, `/items/${primerId}?attributes=seller_id`)).seller_id) === c) { cuentaId = c; break; }
+        } catch (err) { /* no es de esta cuenta */ }
+      }
+      if (!cuentaId) {
+        resumen.errores.push(`${pestaña}: ${primerId} no es de ninguna cuenta conectada al bot`);
         continue;
       }
       const cambios = [];
