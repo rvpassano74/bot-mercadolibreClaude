@@ -26,8 +26,24 @@ const {
   UPSTASH_REDIS_REST_URL,
   UPSTASH_REDIS_REST_TOKEN,
   TELEGRAM_CHAT_ID_RESUMEN,
+  BOT_API_KEY,
   PORT = 3000,
 } = process.env;
+
+// Protege /debug/* y /api/* con una clave secreta (variable BOT_API_KEY
+// en Render). La clave se manda en el header "x-api-key" o en la URL
+// como ?key=LA_CLAVE. Si BOT_API_KEY no está configurada, quedan
+// bloqueadas (mejor cerrado que abierto a cualquiera).
+app.use(['/debug', '/api'], (req, res, next) => {
+  if (!BOT_API_KEY) {
+    return res.status(503).json({ error: 'Falta configurar BOT_API_KEY en Render.' });
+  }
+  const clave = req.get('x-api-key') || req.query.key;
+  if (clave !== BOT_API_KEY) {
+    return res.status(401).json({ error: 'Clave inválida o faltante.' });
+  }
+  next();
+});
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const STOCK_MINIMO = 2; // avisar cuando quedan esta cantidad o menos
@@ -900,6 +916,36 @@ app.post('/telegram/webhook', async (req, res) => {
 app.post('/ml/notifications', async (req, res) => {
   res.sendStatus(200);
   console.log('📩 Notificación recibida de Mercado Libre:', JSON.stringify(req.body));
+});
+
+// =====================================================================
+// API GENÉRICA: llama a cualquier endpoint de la API de Mercado Libre
+// en nombre de una cuenta, usando los tokens que ya maneja el bot (así
+// nadie más tiene que renovarlos y el bot no se desconecta).
+// Ejemplo: GET /api/ml?cuenta=ID&path=/users/me   (header x-api-key)
+// Para POST/PUT/DELETE, el cuerpo JSON se reenvía tal cual.
+// =====================================================================
+
+app.all('/api/ml', async (req, res) => {
+  const { id: cuentaId, error } = resolverCuentaId(req);
+  if (error) return res.status(400).json({ error });
+  const { path } = req.query;
+  if (!path || !path.startsWith('/')) {
+    return res.status(400).json({ error: 'Falta ?path=/ruta/de/la/api (tiene que empezar con /).' });
+  }
+  try {
+    const token = await getAccessToken(cuentaId);
+    const response = await axios({
+      method: req.method,
+      url: `https://api.mercadolibre.com${path}`,
+      headers: { Authorization: `Bearer ${token}` },
+      data: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
+      validateStatus: () => true, // devolvemos tal cual lo que responda ML, incluso errores
+    });
+    res.status(response.status).json(response.data);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
 });
 
 // =====================================================================
