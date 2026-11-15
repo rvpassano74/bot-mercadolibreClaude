@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="es-AR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ventas Mercado Libre</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --fg: #1a1d24; --muted: #5d6472; --line: #e2e5ea; --grid: #eceef2;
+    --ok: #1a7f4b; --bad: #c0392b; --warn: #b7791f;
+    --c1: #2f5bd3; --c2: #e0892b; --c3: #1f9e8f;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif; --display: "Space Grotesk", "Inter", system-ui, sans-serif;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111318; --panel: #191c23; --fg: #e8eaee; --muted: #9aa1ad; --line: #2a2e37; --grid: #23262e;
+      --ok: #4cc38a; --bad: #f07167; --warn: #e0b04c; --c1: #6e93ff; --c2: #f0a24f; --c3: #3cc4b2; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); }
+  .ml { max-width: 1200px; margin: 0 auto; padding: 28px 16px 48px; display: flex; flex-direction: column; gap: 32px; }
+  h1 { font: 500 1.9rem/1.15 var(--display); margin: 0; text-wrap: balance; }
+  h2 { font: 600 1.05rem/1.3 var(--sans); margin: 0; }
+  .lead { margin: 8px 0 0; max-width: 72ch; color: var(--muted); }
+  .lead b { color: var(--fg); font-weight: 600; }
+  .note { font-size: 12px; color: var(--muted); margin: 0; }
+  .estado { font-size: 12px; color: var(--muted); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+  .controls label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  select, button { font: inherit; font-size: 13px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  select:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--c1); outline-offset: 2px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .kpi-label { font-size: 12px; color: var(--muted); letter-spacing: .02em; }
+  .kpi-value { font: 500 1.75rem/1.1 var(--display); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .kpi-delta { font-size: 12px; color: var(--muted); min-height: 1.2em; font-variant-numeric: tabular-nums; }
+  .up { color: var(--ok); } .down { color: var(--bad); }
+  section { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: end; gap: 8px; }
+  .head label { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
+  .chart { position: relative; min-height: 240px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .chart text { fill: var(--muted); font-size: 11px; font-family: var(--sans); }
+  .chart .grid line { stroke: var(--grid); }
+  .tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 6px 20px rgba(0,0,0,.14);
+    border-radius: 8px; padding: 8px 10px; font-size: 12px; min-width: 170px; z-index: 5; font-variant-numeric: tabular-nums; }
+  .tip-t { font-weight: 600; margin-bottom: 2px; }
+  .tip-r { display: flex; justify-content: space-between; gap: 14px; color: var(--muted); }
+  .tip-r span:last-child { color: var(--fg); }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .wrap.tall { max-height: 560px; overflow-y: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 8px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { position: sticky; top: 0; background: var(--panel); font-weight: 600; color: var(--muted); z-index: 1; }
+  th:first-child, td:first-child, td.left { text-align: left; }
+  td.title { text-align: left; white-space: normal; min-width: 220px; max-width: 420px; }
+  td.title a { color: inherit; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tr.click { cursor: pointer; }
+  tr.click:hover td { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+  tr.sel td { background: color-mix(in srgb, var(--c1) 12%, transparent); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid currentColor; }
+  .pill.ok { color: var(--ok); } .pill.warn { color: var(--warn); } .pill.bad { color: var(--bad); } .pill.mut { color: var(--muted); }
+  .msg { padding: 40px 0; text-align: center; color: var(--muted); }
+  details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+  details ul { margin: 8px 0 0; padding-left: 1.2em; font-size: 12px; color: var(--muted); line-height: 1.6; max-width: 75ch; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="ml">
+  <header>
+    <h1>Ventas Mercado Libre</h1>
+    <p class="lead" id="lead">Cargando datos de las cuentas…</p>
+    <div class="estado"><span id="actualizado"></span><button type="button" id="btn-actualizar">Actualizar ahora</button></div>
+  </header>
+
+  <div id="cuerpo" hidden>
+    <div style="display:flex;flex-direction:column;gap:32px">
+      <div class="controls">
+        <label for="f-cuenta">Cuenta <select id="f-cuenta"></select></label>
+        <label for="f-mes">Período <select id="f-mes"></select></label>
+        <button type="button" id="f-reset">Ver todo el año</button>
+      </div>
+
+      <div class="kpis" id="kpis"></div>
+
+      <section>
+        <div class="head"><h2>Facturación día a día</h2><span class="note" id="dia-nota"></span></div>
+        <div class="chart" id="ch-diario"></div>
+      </section>
+
+      <section>
+        <div class="head">
+          <h2>Mes a mes</h2>
+          <label for="f-metrica">Ver
+            <select id="f-metrica">
+              <option value="facturacion">Facturación</option><option value="ordenes">Ventas</option>
+              <option value="unidades">Unidades</option><option value="visitas">Visitas</option>
+            </select>
+          </label>
+        </div>
+        <div class="legend" id="leyenda"></div>
+        <div class="chart" id="ch-mensual"></div>
+        <p class="note">Tocá un mes en el gráfico o en la tabla para ver solo ese mes en todo el tablero.</p>
+        <div class="wrap"><table>
+          <thead><tr><th>Mes</th><th>Facturación</th><th>Ventas</th><th>Unidades</th><th>Ticket prom.</th><th>Visitas</th><th>Conversión</th><th>Fact. por día</th></tr></thead>
+          <tbody id="tb-meses"></tbody>
+        </table></div>
+      </section>
+
+      <section>
+        <h2>Cuentas comparadas</h2>
+        <div class="wrap"><table>
+          <thead><tr><th>Cuenta</th><th>Facturación</th><th>% del total</th><th>Ventas</th><th>Ticket prom.</th><th>Visitas</th><th>Conversión</th><th>Reputación</th><th>Despachos demorados</th><th>Preguntas sin responder</th><th>Publicaciones activas</th></tr></thead>
+          <tbody id="tb-cuentas"></tbody>
+        </table></div>
+      </section>
+
+      <section>
+        <div class="head">
+          <h2>Qué se vende más</h2>
+          <label for="f-orden">Ordenar por
+            <select id="f-orden">
+              <option value="facturacion">Facturación</option><option value="unidades">Unidades</option><option value="ordenes">Ventas</option>
+              <option value="visitas">Visitas</option><option value="conversion">Conversión (con 100+ visitas)</option>
+              <option value="baja">Muchas visitas, poca venta</option>
+            </select>
+          </label>
+        </div>
+        <div class="wrap tall"><table>
+          <thead><tr><th>Producto</th><th>Cuenta</th><th>Facturación</th><th>Unidades</th><th>Ventas</th><th>Precio prom.</th><th>Visitas</th><th>Conversión</th><th>Stock</th><th>Estado</th></tr></thead>
+          <tbody id="tb-productos"></tbody>
+        </table></div>
+        <button type="button" id="ver-mas" style="align-self:flex-start">Ver todos los productos</button>
+      </section>
+
+      <details>
+        <summary>Cómo se calculan los números</summary>
+        <ul>
+          <li>Facturación: precio × cantidad de las órdenes pagadas (incluye las devueltas en parte). No descuenta comisiones, envíos ni impuestos. Las canceladas no cuentan.</li>
+          <li>Ventas: cantidad de órdenes pagadas. Un carrito con varios productos puede contar como más de una venta, como en Mercado Libre.</li>
+          <li>Ticket promedio: facturación ÷ ventas. Conversión: ventas ÷ visitas.</li>
+          <li>En productos, el orden por conversión toma solo los que tuvieron 100 visitas o más, para que no gane uno con 2 visitas y 1 venta.</li>
+          <li>Al elegir un mes, la comparación es contra los mismos días del mes anterior (por ejemplo, 1 al 15 contra 1 al 15).</li>
+          <li>Los datos se recalculan solos cada 2 horas desde Mercado Libre. Las publicaciones borradas no tienen visitas ni stock.</li>
+        </ul>
+      </details>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const KEY = new URLSearchParams(location.search).get('key') || '';
+  const q = (p) => p + (p.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(KEY);
+  const $ = (id) => document.getElementById(id);
+
+  // ---------- formatos ----------
+  const L = d3.formatLocale({ decimal: ',', thousands: '.', grouping: [3], currency: ['$ ', ''] });
+  const TL = d3.timeFormatLocale({ dateTime: '%x %X', date: '%d/%m/%Y', time: '%H:%M', periods: ['', ''],
+    days: ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'], shortDays: ['dom','lun','mar','mié','jue','vie','sáb'],
+    months: ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'],
+    shortMonths: ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'] });
+  const parseDay = d3.utcParse('%Y-%m-%d'), parseMes = d3.utcParse('%Y-%m');
+  const ok = (v) => v != null && isFinite(v);
+  const money = (v) => ok(v) ? L.format('$,.0f')(v) : '—';
+  const int = (v) => ok(v) ? L.format(',d')(Math.round(v)) : '—';
+  const pct = (v) => ok(v) ? L.format(',.2%')(v) : '—';
+  const short = (v, m) => { const p = m ? '$ ' : ''; const a = Math.abs(v);
+    if (a >= 1e6) return p + L.format(',.1f')(v / 1e6).replace(/,0$/, '') + ' M';
+    if (a >= 1e3) return p + L.format(',.0f')(v / 1e3) + ' k'; return p + L.format(',d')(v); };
+  const mesLargo = (m) => { const s = TL.utcFormat('%B %Y')(parseMes(m)); return s[0].toUpperCase() + s.slice(1); };
+  const mesCorto = (m) => TL.utcFormat('%b')(parseMes(m));
+  const dia = (d) => TL.utcFormat('%a %-d %b %Y')(parseDay(d));
+  const ddmm = (d) => d.slice(8, 10) + '/' + d.slice(5, 7) + '/' + d.slice(0, 4);
+  const PALETA = ['var(--c1)', 'var(--c2)', 'var(--c3)', '#8e6ad8', '#d65c8f'];
+
+  // ---------- estado ----------
+  let D = null, CUENTAS = [], todos = false;
+  const S = { cuenta: '', mes: '', metrica: 'facturacion', orden: 'facturacion' };
+  const color = (c) => PALETA[Math.max(0, CUENTAS.indexOf(c)) % PALETA.length];
+  const set = (cambios) => { Object.assign(S, cambios); render(); };
+
+  // ---------- cálculos ----------
+  const sum = (rs) => { const t = { facturacion: 0, ordenes: 0, unidades: 0, visitas: 0 };
+    for (const r of rs) { t.facturacion += r.facturacion; t.ordenes += r.ordenes; t.unidades += r.unidades; t.visitas += r.visitas; } return t; };
+  const porFecha = (rows) => { const m = new Map();
+    for (const r of rows) { let d = m.get(r.fecha); if (!d) { d = { fecha: r.fecha, facturacion: 0, ordenes: 0, unidades: 0, visitas: 0 }; m.set(r.fecha, d); }
+      d.facturacion += r.facturacion; d.ordenes += r.ordenes; d.unidades += r.unidades; d.visitas += r.visitas; }
+    return [...m.values()].sort((a, b) => a.fecha < b.fecha ? -1 : 1); };
+  const filas = () => D.ventas_diarias.filter((r) => !S.cuenta || r.cuenta === S.cuenta);
+
+  function kpis() {
+    const rows = filas();
+    let cur = rows, prev = null, ultimo = null;
+    if (S.mes) {
+      cur = rows.filter((r) => r.fecha.slice(0, 7) === S.mes);
+      ultimo = cur.reduce((m, r) => Math.max(m, +r.fecha.slice(8)), 0);
+      const [y, mm] = S.mes.split('-').map(Number);
+      const pm = mm === 1 ? `${y - 1}-12` : `${y}-${String(mm - 1).padStart(2, '0')}`;
+      prev = rows.filter((r) => r.fecha.slice(0, 7) === pm && +r.fecha.slice(8) <= ultimo);
+    }
+    const c = sum(cur), p = prev && prev.length ? sum(prev) : null;
+    const tk = (t) => t.ordenes ? t.facturacion / t.ordenes : null, cv = (t) => t.visitas ? t.ordenes / t.visitas : null;
+    const ch = (a, b) => (a != null && b) ? a / b - 1 : null;
+    return { ...c, ticket: tk(c), conversion: cv(c), hasta_dia: ultimo, comparable: !!p,
+      v: p ? { facturacion: ch(c.facturacion, p.facturacion), ordenes: ch(c.ordenes, p.ordenes), unidades: ch(c.unidades, p.unidades),
+        visitas: ch(c.visitas, p.visitas), ticket: ch(tk(c), tk(p)), conversion: ch(cv(c), cv(p)) } : {} };
+  }
+  function meses() {
+    const m = new Map();
+    for (const r of filas()) { const k = r.fecha.slice(0, 7); let d = m.get(k);
+      if (!d) { d = { mes: k, facturacion: 0, ordenes: 0, unidades: 0, visitas: 0, dias: new Set() }; m.set(k, d); }
+      d.facturacion += r.facturacion; d.ordenes += r.ordenes; d.unidades += r.unidades; d.visitas += r.visitas; d.dias.add(r.fecha); }
+    return [...m.values()].sort((a, b) => a.mes < b.mes ? 1 : -1).map((d) => ({ ...d, ticket: d.ordenes ? d.facturacion / d.ordenes : null,
+      conversion: d.visitas ? d.ordenes / d.visitas : null, promedio_diario: d.facturacion / d.dias.size }));
+  }
+  function porMesCuenta() {
+    const m = new Map();
+    for (const r of D.ventas_diarias) { const k = r.fecha.slice(0, 7) + '|' + r.cuenta; let d = m.get(k);
+      if (!d) { d = { mes: r.fecha.slice(0, 7), cuenta: r.cuenta, facturacion: 0, ordenes: 0, unidades: 0, visitas: 0 }; m.set(k, d); }
+      d.facturacion += r.facturacion; d.ordenes += r.ordenes; d.unidades += r.unidades; d.visitas += r.visitas; }
+    return [...m.values()];
+  }
+  function porCuenta() {
+    const m = new Map();
+    for (const r of D.ventas_diarias) { if (S.mes && r.fecha.slice(0, 7) !== S.mes) continue;
+      let d = m.get(r.cuenta); if (!d) { d = { facturacion: 0, ordenes: 0, visitas: 0 }; m.set(r.cuenta, d); }
+      d.facturacion += r.facturacion; d.ordenes += r.ordenes; d.visitas += r.visitas; }
+    const total = [...m.values()].reduce((s, d) => s + d.facturacion, 0);
+    return D.cuentas.map((c) => { const d = m.get(c.cuenta) || { facturacion: 0, ordenes: 0, visitas: 0 };
+      return { ...c, ...d, participacion: total ? d.facturacion / total : null, ticket: d.ordenes ? d.facturacion / d.ordenes : null,
+        conversion: d.visitas ? d.ordenes / d.visitas : null }; }).sort((a, b) => b.facturacion - a.facturacion);
+  }
+  function productos() {
+    const cat = new Map(D.catalogo.map((c) => [c.cuenta + '|' + c.item_id, c]));
+    const m = new Map();
+    for (const r of D.productos_mes) {
+      if (S.cuenta && r.cuenta !== S.cuenta) continue;
+      if (S.mes && r.mes !== S.mes) continue;
+      const k = r.cuenta + '|' + r.item_id; let d = m.get(k);
+      if (!d) { d = { clave: k, cuenta: r.cuenta, titulo: r.titulo, facturacion: 0, unidades: 0, ordenes: 0, visitas: 0, item_id: r.item_id }; m.set(k, d); }
+      d.facturacion += r.facturacion; d.unidades += r.unidades; d.ordenes += r.ordenes; d.visitas += r.visitas;
+      if (!d.titulo && r.titulo) d.titulo = r.titulo;
+    }
+    return [...m.values()].map((d) => { const c = cat.get(d.clave);
+      return { ...d, titulo: d.titulo || (c && c.titulo) || d.item_id, precio_promedio: d.unidades ? d.facturacion / d.unidades : null,
+        conversion: d.visitas ? d.ordenes / d.visitas : null, stock: c && c.stock != null ? c.stock : null, estado: c ? c.estado : 'borrada', link: c && c.link };
+    }).sort((a, b) => b.facturacion - a.facturacion);
+  }
+
+  // ---------- helpers de dibujo ----------
+  const el = (tag, props = {}, ...kids) => { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; };
+  const td = (t, cls) => el('td', { textContent: t, className: cls || '' });
+  const vacio = (tb, n, t) => tb.replaceChildren(el('tr', {}, Object.assign(td(t, 'left'), { colSpan: n })));
+  const parcial = (m) => m === D.desde.slice(0, 7) ? ` (desde el ${+D.desde.slice(8)})` : m === D.hasta.slice(0, 7) ? ` (hasta el ${+D.hasta.slice(8)})` : '';
+
+  function tooltip(box, title, rows, x, y) {
+    let t = box.querySelector('.tip'); if (!t) { t = el('div', { className: 'tip' }); box.append(t); }
+    t.replaceChildren(el('div', { className: 'tip-t', textContent: title }), ...rows.map(([k, v, c]) => {
+      const a = el('span', { textContent: k }); if (c) { const s = el('i', { className: 'sw' }); s.style.background = c; s.style.marginRight = '6px'; a.prepend(s); }
+      return el('div', { className: 'tip-r' }, a, el('span', { textContent: v })); }));
+    t.hidden = false;
+    const w = t.offsetWidth, W = box.clientWidth;
+    t.style.left = Math.max(0, Math.min(W - w, x - w / 2)) + 'px';
+    t.style.top = Math.max(0, y - t.offsetHeight - 10) + 'px';
+  }
+  const ocultarTip = (box) => { const t = box.querySelector('.tip'); if (t) t.hidden = true; };
+  const medir = (svg, labels) => { const t = svg.append('text'); let w = 0;
+    for (const l of labels) { t.text(l); w = Math.max(w, t.node().getComputedTextLength()); } t.remove(); return w; };
+
+  function chartDiario() {
+    const box = $('ch-diario'); box.replaceChildren();
+    const rows = porFecha(filas().filter((r) => !S.mes || r.fecha.slice(0, 7) === S.mes));
+    const mesSel = !!S.mes;
+    $('dia-nota').textContent = mesSel ? 'Cada barra es un día. Pasá el mouse o el dedo para ver el detalle.' : 'Línea fina: cada día. Línea gruesa: promedio de los últimos 7 días.';
+    if (!rows.length) { box.append(el('div', { className: 'msg', textContent: 'Sin datos en este período' })); return; }
+    const W = Math.max(280, box.clientWidth - 24), H = Math.round(Math.max(220, Math.min(320, W * 0.36)));
+    const svg = d3.select(box).append('svg').attr('viewBox', `0 0 ${W} ${H}`).attr('role', 'img').attr('aria-label', 'Facturación por día');
+    const ma = rows.map((r, i) => d3.mean(rows.slice(Math.max(0, i - 6), i + 1), (x) => x.facturacion));
+    const y = d3.scaleLinear().domain([0, d3.max(rows, (r) => r.facturacion) || 1]).nice().range([H - 26, 8]);
+    const ticks = y.ticks(W < 500 ? 4 : 5);
+    const ml = medir(svg, ticks.map((t) => short(t, true))) + 10;
+    const x0 = parseDay(rows[0].fecha), x1 = d3.utcDay.offset(parseDay(rows[rows.length - 1].fecha), 1);
+    const x = d3.scaleUtc().domain([x0, x1]).range([ml, W - 6]);
+    svg.append('g').attr('class', 'grid').selectAll('line').data(ticks).join('line').attr('x1', ml).attr('x2', W - 6).attr('y1', y).attr('y2', y);
+    svg.append('g').selectAll('text').data(ticks).join('text').attr('x', ml - 8).attr('y', (t) => y(t) + 4).attr('text-anchor', 'end').text((t) => short(t, true));
+    const xt = mesSel ? x.ticks(d3.utcDay.every(W < 500 ? 7 : 3)) : x.ticks(d3.utcMonth.every(W < 560 ? 2 : 1));
+    svg.append('g').selectAll('text').data(xt).join('text')
+      .attr('x', (t) => x(t) + (mesSel ? (x(d3.utcDay.offset(t, 1)) - x(t)) / 2 : 0)).attr('y', H - 6).attr('text-anchor', mesSel ? 'middle' : 'start')
+      .text((t) => mesSel ? d3.utcFormat('%-d')(t) : mesCorto(d3.utcFormat('%Y-%m')(t)) + (t.getUTCMonth() === 0 || +t === +xt[0] ? ' ' + t.getUTCFullYear() : ''));
+    const c0 = S.cuenta ? color(S.cuenta) : PALETA[0];
+    const mid = (r) => x(d3.utcHour.offset(parseDay(r.fecha), 12));
+    if (mesSel) {
+      const bw = Math.max(1, x(d3.utcDay.offset(x0, 1)) - x(x0) - 2);
+      svg.append('g').selectAll('rect').data(rows).join('rect').attr('x', (r) => x(parseDay(r.fecha)) + 1).attr('width', bw)
+        .attr('y', (r) => y(r.facturacion)).attr('height', (r) => y(0) - y(r.facturacion)).attr('rx', 2).style('fill', c0);
+    } else {
+      svg.append('path').datum(rows).attr('fill', 'none').style('stroke', c0).attr('stroke-opacity', .3).attr('d', d3.line().x(mid).y((r) => y(r.facturacion)));
+      svg.append('path').datum(rows).attr('fill', 'none').style('stroke', c0).attr('stroke-width', 2.2).attr('d', d3.line().x(mid).y((r, i) => y(ma[i])));
+    }
+    const guia = svg.append('line').attr('y1', 8).attr('y2', H - 26).style('stroke', 'var(--muted)').attr('stroke-dasharray', '2 3').attr('visibility', 'hidden');
+    svg.append('rect').attr('x', ml).attr('width', W - 6 - ml).attr('height', H - 20).attr('fill', 'transparent')
+      .on('pointermove', (ev) => {
+        const i = Math.max(0, Math.min(rows.length - 1, d3.utcDay.count(x0, x.invert(d3.pointer(ev)[0]))));
+        const r = rows[i], cx = mid(r), s = svg.node().getBoundingClientRect().width / W;
+        guia.attr('x1', cx).attr('x2', cx).attr('visibility', 'visible');
+        const lines = [['Facturación', money(r.facturacion)], ['Ventas', int(r.ordenes)], ['Unidades', int(r.unidades)], ['Visitas', int(r.visitas)]];
+        if (!mesSel) lines.push(['Promedio 7 días', money(ma[i])]);
+        tooltip(box, dia(r.fecha), lines, cx * s + 12, y(r.facturacion) * s + 12);
+      })
+      .on('pointerleave', () => { ocultarTip(box); guia.attr('visibility', 'hidden'); });
+  }
+
+  const ETQ = { facturacion: 'Facturación', ordenes: 'Ventas', unidades: 'Unidades', visitas: 'Visitas' };
+  function chartMensual() {
+    const box = $('ch-mensual'); box.replaceChildren();
+    const data = porMesCuenta(), metric = S.metrica, isMoney = metric === 'facturacion', fmt = isMoney ? money : int;
+    const keys = S.cuenta ? [S.cuenta] : CUENTAS;
+    const ms = [...new Set(data.map((r) => r.mes))].sort();
+    const table = ms.map((m) => { const o = { mes: m }; for (const c of keys) { const r = data.find((x) => x.mes === m && x.cuenta === c); o[c] = r ? r[metric] : 0; } return o; });
+    const W = Math.max(280, box.clientWidth - 24), H = Math.round(Math.max(220, Math.min(320, W * 0.38)));
+    const svg = d3.select(box).append('svg').attr('viewBox', `0 0 ${W} ${H}`).attr('role', 'img')
+      .attr('aria-label', `${ETQ[metric]} por mes` + (S.cuenta ? ` de ${S.cuenta}` : ', apilada por cuenta'));
+    const y = d3.scaleLinear().domain([0, d3.max(table, (o) => d3.sum(keys, (k) => o[k])) || 1]).nice().range([H - 30, 8]);
+    const ticks = y.ticks(W < 500 ? 4 : 5);
+    const ml = medir(svg, ticks.map((t) => short(t, isMoney))) + 10;
+    const x = d3.scaleBand().domain(ms).range([ml, W - 4]).padding(0.22);
+    svg.append('g').attr('class', 'grid').selectAll('line').data(ticks).join('line').attr('x1', ml).attr('x2', W - 4).attr('y1', y).attr('y2', y);
+    svg.append('g').selectAll('text').data(ticks).join('text').attr('x', ml - 8).attr('y', (t) => y(t) + 4).attr('text-anchor', 'end').text((t) => short(t, isMoney));
+    const every = x.bandwidth() < 22 ? 2 : 1;
+    svg.append('g').selectAll('text').data(ms.filter((m, i) => i % every === (ms.length - 1) % every)).join('text')
+      .attr('x', (m) => x(m) + x.bandwidth() / 2).attr('y', H - 12).attr('text-anchor', 'middle').text(mesCorto);
+    svg.append('g').selectAll('text').data(ms.filter((m, i) => m.endsWith('-01') || i === 0)).join('text')
+      .attr('x', (m) => x(m) + x.bandwidth() / 2).attr('y', H).attr('text-anchor', 'middle').text((m) => m.slice(0, 4));
+    svg.append('g').selectAll('g').data(d3.stack().keys(keys)(table)).join('g').style('fill', (s) => color(s.key))
+      .selectAll('rect').data((s) => s).join('rect').attr('x', (v) => x(v.data.mes)).attr('width', x.bandwidth())
+      .attr('y', (v) => y(v[1])).attr('height', (v) => Math.max(0, y(v[0]) - y(v[1]))).attr('opacity', (v) => !S.mes || v.data.mes === S.mes ? 1 : .3);
+    svg.append('g').selectAll('rect').data(table).join('rect').attr('x', (o) => x(o.mes)).attr('width', x.bandwidth()).attr('height', H - 30)
+      .attr('fill', 'transparent').style('cursor', 'pointer')
+      .on('pointermove', (ev, o) => {
+        const tot = d3.sum(keys, (k) => o[k]), s = svg.node().getBoundingClientRect().width / W;
+        const rows = keys.length > 1 ? keys.map((k) => [k, fmt(o[k]), color(k)]).concat([['Total', fmt(tot)]]) : [[ETQ[metric], fmt(tot)]];
+        tooltip(box, mesLargo(o.mes) + parcial(o.mes), rows, (x(o.mes) + x.bandwidth() / 2) * s + 12, y(tot) * s + 12);
+      })
+      .on('pointerleave', () => ocultarTip(box))
+      .on('click', (ev, o) => set({ mes: S.mes === o.mes ? '' : o.mes }));
+  }
+
+  const REP = { '5_green': ['Verde', 'ok'], '4_light_green': ['Verde claro', 'ok'], '3_yellow': ['Amarilla', 'warn'], '2_orange': ['Naranja', 'bad'], '1_red': ['Roja', 'bad'] };
+  const LIDER = { platinum: 'Platinum', gold: 'Gold', silver: 'Líder' };
+
+  // ---------- render ----------
+  function render() {
+    if (!D) return;
+    $('f-cuenta').value = S.cuenta; $('f-metrica').value = S.metrica; $('f-orden').value = S.orden;
+    const ms = meses();
+    const fm = $('f-mes');
+    fm.replaceChildren(new Option('Últimos 12 meses', ''), ...ms.map((r) => new Option(mesLargo(r.mes) + parcial(r.mes), r.mes)));
+    fm.value = S.mes;
+
+    // Resumen
+    const k = kpis(), pc = porCuenta();
+    const lead = $('lead'); lead.replaceChildren();
+    const b = (t) => el('b', { textContent: t });
+    lead.append((S.cuenta ? `En ${S.cuenta}, ` : 'Entre todas las cuentas, ') +
+      (S.mes ? `en ${mesLargo(S.mes).toLowerCase()}` : `en los últimos 12 meses (${ddmm(D.desde)} al ${ddmm(D.hasta)})`) + ' facturaste ',
+      b(money(k.facturacion)), ' con ', b(int(k.ordenes)), ' ventas.');
+    if (!S.mes && ms.length) { const best = ms.reduce((a, r) => r.facturacion > a.facturacion ? r : a);
+      lead.append(` El mejor mes fue ${mesLargo(best.mes).toLowerCase()}, con `, b(money(best.facturacion)), '.'); }
+    if (!S.cuenta && pc.length > 1 && pc[0].facturacion > 0) lead.append(` ${pc[0].cuenta} aporta el `, b(pct(pc[0].participacion)), ' de la facturación.');
+
+    const diasDelMes = S.mes ? new Date(Date.UTC(+S.mes.slice(0, 4), +S.mes.slice(5, 7), 0)).getUTCDate() : 0;
+    const etiqueta = !S.mes ? 'Últimos 12 meses' : !k.comparable ? 'sin mes anterior para comparar'
+      : k.hasta_dia >= diasDelMes ? 'vs. el mes anterior' : `vs. días 1 al ${k.hasta_dia} del mes anterior`;
+    const tarjeta = (label, valor, cambio) => {
+      const d = el('span', { className: 'kpi-delta' });
+      if (ok(cambio)) d.append(el('span', { className: cambio >= 0 ? 'up' : 'down', textContent: (cambio > 0 ? '+' : '') + pct(cambio) }), ' ');
+      d.append(etiqueta);
+      return el('div', { className: 'kpi' }, el('span', { className: 'kpi-label', textContent: label }), el('span', { className: 'kpi-value', textContent: valor }), d);
+    };
+    $('kpis').replaceChildren(
+      tarjeta('Facturación', money(k.facturacion), k.v.facturacion), tarjeta('Ventas (órdenes)', int(k.ordenes), k.v.ordenes),
+      tarjeta('Unidades vendidas', int(k.unidades), k.v.unidades), tarjeta('Ticket promedio', money(k.ticket), k.v.ticket),
+      tarjeta('Visitas', int(k.visitas), k.v.visitas), tarjeta('Conversión (ventas ÷ visitas)', pct(k.conversion), k.v.conversion));
+
+    $('leyenda').replaceChildren(...(S.cuenta ? [S.cuenta] : CUENTAS).map((c) => { const s = el('i', { className: 'sw' }); s.style.background = color(c); return el('span', {}, s, c); }));
+    chartDiario(); chartMensual();
+
+    $('tb-meses').replaceChildren(...ms.map((r) => {
+      const tr = el('tr', { className: 'click' + (r.mes === S.mes ? ' sel' : '') },
+        td(mesLargo(r.mes) + parcial(r.mes)), td(money(r.facturacion)), td(int(r.ordenes)), td(int(r.unidades)), td(money(r.ticket)),
+        td(int(r.visitas)), td(pct(r.conversion)), td(money(r.promedio_diario)));
+      tr.onclick = () => set({ mes: S.mes === r.mes ? '' : r.mes });
+      return tr;
+    }));
+
+    $('tb-cuentas').replaceChildren(...pc.map((r) => {
+      const [rl, rc] = REP[r.reputacion] || ['Sin datos', 'mut'];
+      const dem = td(pct(r.demoras)); if (ok(r.demoras) && r.demoras > 0.1) dem.className = 'down';
+      const pq = td(int(r.preguntas_sin_responder)); if (r.preguntas_sin_responder > 0) pq.className = 'down';
+      return el('tr', {}, td(r.cuenta), td(money(r.facturacion)), td(pct(r.participacion)), td(int(r.ordenes)), td(money(r.ticket)),
+        td(int(r.visitas)), td(pct(r.conversion)), el('td', {}, el('span', { className: 'pill ' + rc, textContent: rl + (LIDER[r.mercadolider] ? ' · ' + LIDER[r.mercadolider] : '') })),
+        dem, pq, td(int(r.publicaciones_activas)));
+    }));
+
+    let ps = productos();
+    if (S.orden === 'conversion') ps = ps.filter((r) => r.visitas >= 100).sort((a, b) => b.conversion - a.conversion);
+    else if (S.orden === 'baja') ps = ps.filter((r) => r.visitas >= 100).sort((a, b) => (a.conversion - b.conversion) || (b.visitas - a.visitas));
+    else if (S.orden !== 'facturacion') ps.sort((a, b) => b[S.orden] - a[S.orden]);
+    const tbp = $('tb-productos');
+    if (!ps.length) vacio(tbp, 10, 'Sin productos en este período');
+    else tbp.replaceChildren(...(todos ? ps : ps.slice(0, 25)).map((r) => {
+      const t = el('td', { className: 'title' });
+      if (r.link && /^https:\/\/[a-z.]*mercadolibre\.com\.ar\//.test(r.link)) t.append(el('a', { href: r.link, target: '_blank', rel: 'noopener', textContent: r.titulo }));
+      else t.textContent = r.titulo;
+      const st = td(r.stock == null ? '—' : int(r.stock)); if (r.estado === 'activa' && r.stock != null && r.stock <= 5) st.className = 'down';
+      return el('tr', {}, t, td(r.cuenta, 'left'), td(money(r.facturacion)), td(int(r.unidades)), td(int(r.ordenes)), td(money(r.precio_promedio)),
+        td(r.visitas ? int(r.visitas) : '—'), td(r.visitas ? pct(r.conversion) : '—'), st,
+        el('td', {}, el('span', { className: 'pill ' + (r.estado === 'activa' ? 'ok' : 'mut'), textContent: r.estado })));
+    }));
+    $('ver-mas').hidden = ps.length <= 25;
+    $('ver-mas').textContent = todos ? 'Ver solo los primeros 25' : `Ver todos los productos (${ps.length})`;
+  }
+
+  // ---------- controles ----------
+  $('f-cuenta').onchange = (e) => set({ cuenta: e.target.value });
+  $('f-mes').onchange = (e) => set({ mes: e.target.value });
+  $('f-metrica').onchange = (e) => set({ metrica: e.target.value });
+  $('f-orden').onchange = (e) => set({ orden: e.target.value });
+  $('f-reset').onclick = () => set({ cuenta: '', mes: '' });
+  $('ver-mas').onclick = () => { todos = !todos; render(); };
+  let ancho = window.innerWidth;
+  window.addEventListener('resize', () => { if (Math.abs(window.innerWidth - ancho) > 30) { ancho = window.innerWidth; render(); } });
+
+  // ---------- carga ----------
+  const hace = (iso) => { const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
+    return m < 1 ? 'recién' : m < 60 ? `hace ${m} min` : `hace ${Math.round(m / 60)} h`; };
+  let espera = null;
+  async function cargar() {
+    clearTimeout(espera);
+    try {
+      const r = await fetch(q('/dashboard/datos'));
+      if (r.status === 401) { $('lead').textContent = 'Falta la clave: abrí esta página con ?key=TU_CLAVE al final del link.'; return; }
+      const j = await r.json();
+      if (j.calculando) {
+        $('lead').textContent = j.error ? `No se pudieron traer los datos: ${j.error}. Reintentando…` : 'Juntando el último año de ventas de las cuentas. Tarda unos minutos la primera vez…';
+        espera = setTimeout(cargar, 15000); return;
+      }
+      const nuevo = !D;
+      D = j; CUENTAS = D.cuentas.map((c) => c.cuenta);
+      if (nuevo) $('f-cuenta').replaceChildren(new Option('Todas las cuentas', ''), ...D.cuentas.map((c) => new Option(c.nickname && c.nickname !== c.cuenta ? `${c.cuenta} (${c.nickname})` : c.cuenta, c.cuenta)));
+      if (S.mes && !D.ventas_diarias.some((r) => r.fecha.startsWith(S.mes))) S.mes = '';
+      $('cuerpo').hidden = false;
+      $('actualizado').textContent = `Datos de Mercado Libre, actualizados ${hace(D.generado)}` + (D.actualizando ? ' · actualizando…' : '') + (D.error ? ` · la última actualización falló (${D.error})` : '');
+      $('btn-actualizar').disabled = !!D.actualizando;
+      render();
+      if (D.actualizando) espera = setTimeout(cargar, 20000);
+    } catch (e) {
+      $('lead').textContent = 'No se pudo conectar con el bot. Reintentando…';
+      espera = setTimeout(cargar, 15000);
+    }
+  }
+  $('btn-actualizar').onclick = async () => {
+    $('btn-actualizar').disabled = true;
+    try { await fetch(q('/dashboard/actualizar'), { method: 'POST' }); } catch (e) {}
+    $('actualizado').textContent = 'Actualizando… tarda unos minutos.';
+    espera = setTimeout(cargar, 20000);
+  };
+  setInterval(() => { if (D && !D.actualizando) cargar(); }, 30 * 60 * 1000);
+  cargar();
+})();
+</script>
+</body>
+</html>

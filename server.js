@@ -5,6 +5,7 @@ const { google } = require('googleapis');
 const { PDFDocument } = require('pdf-lib');
 const FormData = require('form-data');
 const ExcelJS = require('exceljs');
+const { registrarDashboard } = require('./dashboard');
 
 const app = express();
 app.use(express.json());
@@ -30,14 +31,14 @@ const {
   PORT = 3000,
 } = process.env;
 
-// Protege la página principal (/), /cuentas/*, /debug/* y /api/* con una
+// Protege la página principal (/), /cuentas/*, /debug/*, /api/* y /dashboard con una
 // clave secreta (variable BOT_API_KEY en Render). La clave se manda en el
 // header "x-api-key" o en la URL como ?key=LA_CLAVE. Si BOT_API_KEY no
 // está configurada, quedan bloqueadas (mejor cerrado que abierto a
 // cualquiera). /oauth/callback y /telegram/webhook quedan abiertas porque
 // las llaman Mercado Libre y Telegram.
 app.use((req, res, next) => {
-  const protegida = req.path === '/' || /^\/(debug|api|cuentas)(\/|$)/i.test(req.path);
+  const protegida = req.path === '/' || /^\/(debug|api|cuentas|dashboard)(\/|$)/i.test(req.path);
   if (!protegida) return next();
   if (!BOT_API_KEY) {
     return res.status(503).json({ error: 'Falta configurar BOT_API_KEY en Render.' });
@@ -4012,12 +4013,16 @@ app.get('/debug/orden-detalle', async (req, res) => {
   }
 });
 
+// Dashboard de ventas de las cuentas conectadas (ver dashboard.js).
+const dashboard = registrarDashboard(app, { mlGet, getCuentas: () => data.cuentas || {}, zonaHoraria: ZONA_HORARIA });
+
 async function start() {
   data = await loadData();
   await saveData(data); // por si se acaba de migrar del formato viejo
   await corregirNombresGenericos();
   app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
   setInterval(revisarTodo, 60 * 1000); // cada 1 minuto
+  dashboard.iniciar();
   revisarTodo(); // y una vez apenas arranca
   if (PROMO_SHEET_ID) {
     setInterval(() => revisarPromociones(), PROMO_CADA_MS); // promociones desde la planilla, cada 2 horas
