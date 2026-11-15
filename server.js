@@ -643,6 +643,23 @@ function partirEnGrupos(lista, tamano) {
   return grupos;
 }
 
+// MercadoLibre dio de baja la consulta de varias publicaciones juntas (/items?ids=): se piden de a una.
+async function obtenerItems(ids, attributes, token) {
+  const items = [];
+  for (const id of ids) {
+    try {
+      const { data } = await axios.get(`https://api.mercadolibre.com/items/${id}`, {
+        params: { attributes },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      items.push({ body: data });
+    } catch (err) {
+      console.error(`Error leyendo publicación ${id}:`, err.response?.data || err.message);
+    }
+  }
+  return items;
+}
+
 // Descarga las etiquetas de un grupo de shipment_ids. Si Mercado Libre
 // rechaza el pedido completo porque ALGUNO de esos envíos ya no está
 // en estado "imprimible" (por ejemplo, porque ya se despachó a mano
@@ -701,10 +718,7 @@ async function revisarStockBajo() {
       let huboAlerta = false;
 
       for (const grupo of partirEnGrupos(itemIds, 20)) {
-        const { data: items } = await axios.get('https://api.mercadolibre.com/items', {
-          params: { ids: grupo.join(','), attributes: 'id,title,available_quantity' },
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const items = await obtenerItems(grupo, 'id,title,available_quantity', token);
 
         for (const { body: item } of items) {
           if (!item) continue;
@@ -1792,10 +1806,7 @@ app.get('/debug/list-stock', async (req, res) => {
     const itemIds = idsResponse.results || [];
     const resultado = [];
     for (const grupo of partirEnGrupos(itemIds, 20)) {
-      const { data: items } = await axios.get('https://api.mercadolibre.com/items', {
-        params: { ids: grupo.join(','), attributes: 'id,title,available_quantity' },
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const items = await obtenerItems(grupo, 'id,title,available_quantity', token);
       for (const { body: item } of items) {
         if (!item) continue;
         resultado.push({
@@ -3721,10 +3732,7 @@ app.get('/debug/listado-publicaciones', async (req, res) => {
       const itemIds = idsResponse.results || [];
 
       for (const grupo of partirEnGrupos(itemIds, 20)) {
-        const { data: items } = await axios.get('https://api.mercadolibre.com/items', {
-          params: { ids: grupo.join(','), attributes: 'id,title,available_quantity,variations' },
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const items = await obtenerItems(grupo, 'id,title,available_quantity,variations', token);
         for (const { body: item } of items) {
           if (!item) continue;
           if (Array.isArray(item.variations) && item.variations.length) {
