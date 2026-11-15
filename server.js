@@ -1050,9 +1050,19 @@ async function procesarFilaPromo(cuentaId, fila, modo) {
   let precioQuiero = Number(fila[PCOL.precioQuiero]) || 0;
   const out = { escribirPrecioQuiero: false };
 
-  const item = await mlGet(cuentaId, `/items/${id}?attributes=id,title,price,status,category_id,listing_type_id,shipping,seller_id`);
+  const item = await mlGet(cuentaId, `/items/${id}?attributes=id,title,price,status,sub_status,category_id,listing_type_id,shipping,seller_id`);
   if (String(item.seller_id) !== String(cuentaId)) return { ...out, estado: 'Esta publicación no es de esta cuenta' };
-  if (item.status !== 'active') return { ...out, estado: `Publicación no activa (${item.status})` };
+  if (item.status === 'closed') return { ...out, estado: 'Publicación cerrada (ya no está a la venta)' };
+  if (item.status !== 'active') {
+    // Pausada: se muestran sus precios pero no se activan promociones hasta que la reactives.
+    const motivo = item.status === 'paused'
+      ? ((item.sub_status || []).includes('out_of_stock') ? 'Pausada sin stock' : 'Pausada por vos')
+      : `Publicación no activa (${item.status})`;
+    const precioMax = redondear2(item.price * 0.95);
+    out.info = [item.price, 'Sin promoción', '', await calcularRecibis(cuentaId, item, item.price), '',
+      precioMax, await calcularRecibis(cuentaId, item, precioMax)];
+    return { ...out, estado: `${motivo}. Cuando la reactives, el bot le activa la promoción en la próxima revisión.` };
+  }
 
   let promos;
   try {
@@ -1148,22 +1158,186 @@ async function procesarFilaPromo(cuentaId, fila, modo) {
   }
 }
 
+// ---------------------------------------------------------------------
+// Sincronización: agrega a la planilla (solapa de la cuenta + Tablero) las
+// publicaciones de MercadoLibre activas o pausadas que todavía no estén.
+// Los productos de Mercado Pago (canales mp-merchants/mp-link) se ignoran.
+// ---------------------------------------------------------------------
+
+const sinAcentos = (s) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+const colLetra = (i) => String.fromCharCode(65 + i); // 0 -> A
+
+// Nombre de producto común a las 3 cuentas, sacado del título (tipo, calibre, largo, cantidad).
+function claveProducto(titulo) {
+  const t = sinAcentos(titulo).replace(/\s+/g, ' ');
+  if (/guardapolvo|ambo/.test(t)) {
+    const m = t.match(/dise[n]o\s*-\s*(.+)$/);
+    return 'Guardapolvo ' + (m ? m[1] : t).replace(/\b(\w)/g, (c) => c.toUpperCase());
+  }
+  let tipo;
+  if (/butterfly/.test(t)) tipo = 'Aguja Butterfly';
+  else if (/nanoso/.test(t)) tipo = 'Aguja Nanosoft 4 pin';
+  else if (/labios/.test(t)) tipo = 'Agujas 12 pin labios';
+  else if (/cartucho/.test(t)) tipo = 'Cartuchos A6';
+  else if (/dr pen|pen ultima|ultima a6/.test(t)) return 'Dr Pen Ultima A6';
+  else if (/nokor/.test(t)) tipo = 'Aguja Nokor';
+  else if (/jeringa/.test(t)) tipo = 'Jeringa Luer Lock 1ml';
+  else if (/llave/.test(t)) tipo = 'Llave de transferencia';
+  else if (/colageno/.test(t)) tipo = 'Mascarilla colágeno';
+  else if (/mascar/.test(t)) tipo = 'Máscara reparadora';
+  else if (/gluteo|corporal/.test(t)) tipo = 'Microcánula glúteos';
+  else if (/canula/.test(t)) tipo = /sutux/.test(t) ? 'Microcánula Sutux' : 'Microcánula';
+  else if (/mesoterapia|^aguja \d+g/.test(t)) tipo = 'Aguja Mesoterapia';
+  else return titulo;
+  const pares = [...t.matchAll(/(\d{2})g\s*(?:x\s*)?(\d+(?:\.\d+)?)\s*mm/g)];
+  let g = pares.length ? pares[pares.length - 1][1] : (t.match(/(\d{2})g\b/) || [])[1];
+  let mm = pares.length ? pares[pares.length - 1][2] : (t.match(/(\d+(?:\.\d+)?)\s*mm/) || [])[1];
+  if (/\d{2}g\s*\/\s*\d{2}g/.test(t) && !pares.length) g = 'varios';
+  const q = (t.match(/(?:x|pack)\s*(\d+)\s*(?:un\b|unidades|uni\b|u\b)?/g) || [])
+    .map((s) => +s.match(/\d+/)[0]).filter((n) => n !== 5 || !/x 05mm/.test(t));
+  let cant = q.length ? q[q.length - 1] : (t.match(/(\d+)\s*un\b/) || [])[1];
+  if (/x unidad/.test(t)) cant = 1;
+  let pin = '';
+  if (tipo === 'Cartuchos A6') {
+    if (/12\/24\/36/.test(t)) pin = 'surtidos';
+    else pin = (t.match(/(nano|\d{2}) pin/) || t.match(/\b(nano)\b/) || [])[1] || '';
+    pin = pin ? (pin === 'nano' ? 'nano' : pin + ' pin') : '';
+  }
+  if (tipo === 'Llave de transferencia' || tipo.startsWith('Másc') || tipo.startsWith('Masc')) { g = ''; mm = ''; }
+  if (tipo === 'Aguja Nanosoft 4 pin') { g = '34'; mm = '1.5'; }
+  if (tipo === 'Agujas 12 pin labios') { g = '30'; mm = '0.5'; }
+  return [tipo, pin, g && g !== 'varios' ? g + 'g' : g, mm ? mm + 'mm' : '', cant ? 'x' + cant : ''].filter(Boolean).join(' ');
+}
+
+async function idsDeCuenta(cuentaId, estado) {
+  const ids = [];
+  for (let offset = 0; ; offset += 50) {
+    const r = await mlGet(cuentaId, `/users/${cuentaId}/items/search?status=${estado}&limit=50&offset=${offset}`);
+    ids.push(...(r.results || []));
+    if (!r.results || r.results.length < 50) break;
+  }
+  return ids;
+}
+
+// Fórmulas de una fila del Tablero: precio publicado y "recibís hoy" de cada cuenta.
+function formulasTablero(r, titulosCuentas) {
+  return titulosCuentas.flatMap((titulo, b) => {
+    if (!titulo) return ['', '', ''];
+    const T = `'${titulo}'`;
+    const C = colLetra(10 + b);
+    return [
+      `=IF($${C}${r}="";"";IFERROR(LET(f;MATCH($${C}${r};${T}!$A:$A;0);p;INDEX(${T}!$E:$E;f);IF(p="";INDEX(${T}!$C:$C;f);p));""))`,
+      `=IF($${C}${r}="";"";IFERROR(INDEX(${T}!$F:$F;MATCH($${C}${r};${T}!$A:$A;0));""))`,
+      '',
+    ];
+  });
+}
+
+// pestañas: [{ title, sheetId, cuentaId, filas }]. Las filas nuevas se insertan
+// DENTRO de los rangos existentes para que hereden formato, filtros y protección.
+async function sincronizarPlanilla(sheets, meta, pestañas, resumen) {
+  const tabMeta = meta.sheets.find((s) => s.properties.title === 'Tablero');
+  let tablero = null;
+  if (tabMeta) {
+    const { data: t } = await sheets.spreadsheets.values.get({
+      spreadsheetId: PROMO_SHEET_ID, range: 'Tablero!A1:M', valueRenderOption: 'UNFORMATTED_VALUE',
+    });
+    const v = t.values || [];
+    const encabezado = v[0] || [];
+    tablero = {
+      sheetId: tabMeta.properties.sheetId,
+      titulosCuentas: [encabezado[1] || '', encabezado[4] || '', encabezado[7] || ''],
+      filas: v.slice(2).map((f) => ({ producto: String(f[0] || ''), ids: [f[10] || '', f[11] || '', f[12] || ''] })),
+    };
+  }
+  const base = (x) => x.replace(/ \(\d+ª publicación\)$/, '');
+  const requests = [];
+  const escrituras = [];
+
+  for (const p of pestañas) {
+    const enPlanilla = new Set(p.filas.map((f) => String(f[PCOL.id] || '').trim()));
+    const nuevos = [];
+    for (const id of [...await idsDeCuenta(p.cuentaId, 'active'), ...await idsDeCuenta(p.cuentaId, 'paused')]) {
+      if (enPlanilla.has(id)) continue;
+      const it = await mlGet(p.cuentaId, `/items/${id}?attributes=id,title,channels`);
+      if ((it.channels || []).includes('marketplace')) nuevos.push(it);
+    }
+    if (!nuevos.length) continue;
+
+    // Solapa de la cuenta: se insertan antes de la última fila (índice n).
+    const n = p.filas.length;
+    const bloque = tablero ? tablero.titulosCuentas.indexOf(p.title) : -1;
+    requests.push({ insertDimension: { range: { sheetId: p.sheetId, dimension: 'ROWS', startIndex: Math.max(n, 1), endIndex: Math.max(n, 1) + nuevos.length }, inheritFromBefore: n > 0 } });
+    nuevos.forEach((it, k) => {
+      const r = Math.max(n, 1) + 1 + k;
+      escrituras.push({ range: `'${p.title}'!A${r}:B${r}`, values: [[it.id, it.title]] });
+      if (bloque >= 0) {
+        const Q = colLetra(3 + 3 * bloque);
+        const I = colLetra(10 + bloque);
+        escrituras.push({ range: `'${p.title}'!J${r}`, values: [[`=IFERROR(INDEX(Tablero!$${Q}:$${Q};MATCH($A${r};Tablero!$${I}:$${I};0));"")`]] });
+      }
+      resumen.agregadas.push(`[${p.title}] ${it.title}`);
+    });
+
+    // Tablero: misma fila del producto si esa cuenta la tiene libre; si no, fila nueva al lado.
+    if (bloque < 0 || !tablero.filas.length) continue;
+    for (const it of nuevos) {
+      const clave = claveProducto(it.title);
+      const mismas = tablero.filas.map((f, i) => [f, i]).filter(([f]) => base(f.producto) === clave);
+      const libre = mismas.find(([f]) => !f.ids[bloque]);
+      if (libre) { libre[0].ids[bloque] = it.id; libre[0].cambio = true; continue; }
+      let pos;
+      if (mismas.length) pos = mismas[mismas.length - 1][1] + 1;
+      else {
+        const tipo = clave.split(' ').slice(0, 2).join(' ');
+        const mismoTipo = tablero.filas.map((f, i) => [f, i]).filter(([f]) => base(f.producto).startsWith(tipo));
+        pos = mismoTipo.length ? mismoTipo[mismoTipo.length - 1][1] + 1 : tablero.filas.length;
+      }
+      pos = Math.min(pos, tablero.filas.length - 1); // dentro del rango con formato
+      const nueva = { producto: mismas.length ? `${clave} (${mismas.length + 1}ª publicación)` : clave, ids: ['', '', ''], nueva: true };
+      nueva.ids[bloque] = it.id;
+      requests.push({ insertDimension: { range: { sheetId: tablero.sheetId, dimension: 'ROWS', startIndex: 2 + pos, endIndex: 3 + pos }, inheritFromBefore: true } });
+      tablero.filas.splice(pos, 0, nueva);
+    }
+  }
+  if (!requests.length) return;
+
+  if (tablero) {
+    tablero.filas.forEach((f, i) => {
+      const r = 3 + i;
+      if (f.nueva) {
+        const formulas = formulasTablero(r, tablero.titulosCuentas);
+        escrituras.push({ range: `Tablero!A${r}:M${r}`, values: [[f.producto, ...formulas, ...f.ids]] });
+      } else if (f.cambio) {
+        escrituras.push({ range: `Tablero!K${r}:M${r}`, values: [f.ids] });
+      }
+    });
+  }
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId: PROMO_SHEET_ID, requestBody: { requests } });
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: PROMO_SHEET_ID, requestBody: { valueInputOption: 'USER_ENTERED', data: escrituras },
+  });
+}
+
 // Recorre la planilla. "solo" = procesar una única publicación (pruebas).
 async function revisarPromociones({ modo = PROMO_MODO, solo = null } = {}) {
   if (!PROMO_SHEET_ID) return { error: 'Falta la variable PROMO_SHEET_ID en Render.' };
   if (promosEnCurso) return { error: 'Ya hay una corrida de promociones en curso.' };
   promosEnCurso = true;
-  const resumen = { inicio: new Date().toISOString(), modo, solo, pestañas: {}, acciones: [], errores: [] };
+  const resumen = { inicio: new Date().toISOString(), modo, solo, pestañas: {}, agregadas: [], acciones: [], errores: [] };
   try {
     const sheets = await clienteSheets();
-    const { data: meta } = await sheets.spreadsheets.get({ spreadsheetId: PROMO_SHEET_ID, fields: 'sheets.properties.title' });
-    for (const { properties: { title: pestaña } } of meta.sheets) {
-      const { data: valores } = await sheets.spreadsheets.values.get({
-        spreadsheetId: PROMO_SHEET_ID, range: `'${pestaña}'!A2:M`, valueRenderOption: 'UNFORMATTED_VALUE',
-      });
-      const filas = valores.values || [];
-      // A qué cuenta corresponde la pestaña: la dueña de su primera
-      // publicación (ML solo deja ver la publicación con el token de su dueña).
+    const { data: meta } = await sheets.spreadsheets.get({ spreadsheetId: PROMO_SHEET_ID, fields: 'sheets.properties(sheetId,title)' });
+    const leerFilas = async (pestaña) => (await sheets.spreadsheets.values.get({
+      spreadsheetId: PROMO_SHEET_ID, range: `'${pestaña}'!A2:M`, valueRenderOption: 'UNFORMATTED_VALUE',
+    })).data.values || [];
+
+    // A qué cuenta corresponde cada pestaña: la dueña de su primera
+    // publicación (ML solo deja ver la publicación con el token de su dueña).
+    const pestañas = [];
+    for (const { properties: { title, sheetId } } of meta.sheets) {
+      if (title === 'Tablero') continue;
+      const filas = await leerFilas(title);
       const primerId = filas.map((f) => String(f[PCOL.id] || '').trim()).find((x) => /^MLA\d+$/.test(x));
       if (!primerId) continue;
       let cuentaId = null;
@@ -1173,9 +1347,22 @@ async function revisarPromociones({ modo = PROMO_MODO, solo = null } = {}) {
         } catch (err) { /* no es de esta cuenta */ }
       }
       if (!cuentaId) {
-        resumen.errores.push(`${pestaña}: ${primerId} no es de ninguna cuenta conectada al bot`);
+        resumen.errores.push(`${title}: ${primerId} no es de ninguna cuenta conectada al bot`);
         continue;
       }
+      pestañas.push({ title, sheetId, cuentaId, filas });
+    }
+
+    if (!solo) {
+      try {
+        await sincronizarPlanilla(sheets, meta, pestañas, resumen);
+      } catch (err) {
+        resumen.errores.push(`Sincronización: ${err.response?.data?.error?.message || err.response?.data?.message || err.message}`);
+      }
+    }
+
+    for (const { title: pestaña, cuentaId } of pestañas) {
+      const filas = await leerFilas(pestaña); // releída: la sincronización pudo agregar filas
       const cambios = [];
       let procesadas = 0;
       for (let i = 0; i < filas.length; i++) {
@@ -1207,12 +1394,13 @@ async function revisarPromociones({ modo = PROMO_MODO, solo = null } = {}) {
     // Aviso por Telegram: en modo "auto" cada vez que hizo algo; en modo
     // "aviso" una sola vez por día (para no repetir lo mismo cada 2 horas).
     const hoy = fechaHoyAR();
-    const avisar = resumen.acciones.length || resumen.errores.length;
-    if (avisar && TELEGRAM_CHAT_ID && (modo === 'auto' || solo || data.promos_aviso_fecha !== hoy)) {
+    const avisar = resumen.acciones.length || resumen.errores.length || resumen.agregadas.length;
+    if (avisar && TELEGRAM_CHAT_ID && (modo === 'auto' || solo || resumen.agregadas.length || data.promos_aviso_fecha !== hoy)) {
       let texto = modo === 'auto'
         ? '🏷️ Promociones: esto hice ahora'
         : '🏷️ Promociones (MODO AVISO, no toqué nada en MercadoLibre). Esto haría:';
-      texto += `\n\n${resumen.acciones.join('\n')}`;
+      texto += `\n\n${resumen.acciones.join('\n') || '(nada para activar)'}`;
+      if (resumen.agregadas.length) texto += `\n\n➕ Agregué a la planilla (cargales "Quiero recibir" en el Tablero):\n${resumen.agregadas.join('\n')}`;
       if (resumen.errores.length) texto += `\n\n⚠️ Errores:\n${resumen.errores.join('\n')}`;
       if (texto.length > 3900) texto = texto.slice(0, 3900) + '\n… (sigue en la planilla, columna Estado)';
       await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: texto });
