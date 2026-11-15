@@ -100,6 +100,20 @@
 
       <section>
         <div class="head">
+          <h2>Qué día de la semana se vende más</h2>
+          <label for="f-semana">Ver
+            <select id="f-semana">
+              <option value="facturacion">Facturación promedio</option><option value="ordenes">Ventas promedio</option>
+              <option value="unidades">Unidades promedio</option>
+            </select>
+          </label>
+        </div>
+        <p class="lead" id="semana-resumen" style="margin:0"></p>
+        <div class="chart" id="ch-semana"></div>
+      </section>
+
+      <section>
+        <div class="head">
           <h2>Mes a mes</h2>
           <label for="f-metrica">Ver
             <select id="f-metrica">
@@ -150,6 +164,7 @@
           <li>Ventas: cantidad de órdenes pagadas. Un carrito con varios productos puede contar como más de una venta, como en Mercado Libre.</li>
           <li>Ticket promedio: facturación ÷ ventas. Conversión: ventas ÷ visitas.</li>
           <li>En productos, el orden por conversión toma solo los que tuvieron 100 visitas o más, para que no gane uno con 2 visitas y 1 venta.</li>
+          <li>Promedio por día de la semana: lo vendido todos los lunes del período ÷ cuántos lunes hubo (los días sin ventas cuentan como cero), y así con cada día.</li>
           <li>Al elegir un mes, la comparación es contra los mismos días del mes anterior (por ejemplo, 1 al 15 contra 1 al 15).</li>
           <li>Los datos se recalculan solos cada 2 horas desde Mercado Libre. Las publicaciones borradas no tienen visitas ni stock.</li>
         </ul>
@@ -186,7 +201,7 @@
 
   // ---------- estado ----------
   let D = null, CUENTAS = [], todos = false;
-  const S = { cuenta: '', mes: '', metrica: 'facturacion', orden: 'facturacion' };
+  const S = { cuenta: '', mes: '', metrica: 'facturacion', orden: 'facturacion', semana: 'facturacion' };
   const color = (c) => PALETA[Math.max(0, CUENTAS.indexOf(c)) % PALETA.length];
   const set = (cambios) => { Object.assign(S, cambios); render(); };
 
@@ -321,6 +336,65 @@
       .on('pointerleave', () => { ocultarTip(box); guia.attr('visibility', 'hidden'); });
   }
 
+  // Promedio por día de la semana: total de ese día de la semana ÷ cuántos hubo en el período
+  // (los días sin ventas cuentan como cero). Cada cuenta cuenta desde su primer día con
+  // ventas o visitas, para que una cuenta nueva no baje los promedios con meses vacíos.
+  const DIAS_SEM = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
+  function porDiaSemana() {
+    const inicio = {};
+    for (const r of D.ventas_diarias) if ((r.ordenes || r.visitas) && !(inicio[r.cuenta] <= r.fecha)) inicio[r.cuenta] = r.fecha;
+    const rows = porFecha(filas().filter((r) => (!S.mes || r.fecha.slice(0, 7) === S.mes) && inicio[r.cuenta] && r.fecha >= inicio[r.cuenta]));
+    const g = DIAS_SEM.map((nombre) => ({ nombre, dias: 0, facturacion: 0, ordenes: 0, unidades: 0 }));
+    for (const r of rows) {
+      const d = g[(parseDay(r.fecha).getUTCDay() + 6) % 7];
+      d.dias++; d.facturacion += r.facturacion; d.ordenes += r.ordenes; d.unidades += r.unidades;
+    }
+    const total = d3.sum(g, (d) => d.facturacion);
+    return g.map((d) => ({ ...d, prom: { facturacion: d.dias ? d.facturacion / d.dias : 0, ordenes: d.dias ? d.ordenes / d.dias : 0, unidades: d.dias ? d.unidades / d.dias : 0 },
+      ticket: d.ordenes ? d.facturacion / d.ordenes : null, participacion: total ? d.facturacion / total : null }));
+  }
+
+  function chartSemana() {
+    const box = $('ch-semana'); box.replaceChildren();
+    const g = porDiaSemana(), metric = S.semana, isMoney = metric === 'facturacion';
+    const fmt = isMoney ? money : (v) => L.format(',.1f')(v);
+    const res = $('semana-resumen'); res.replaceChildren();
+    if (!d3.sum(g, (d) => d.dias)) { box.append(el('div', { className: 'msg', textContent: 'Sin datos en este período' })); return; }
+    const orden = g.slice().sort((a, b) => b.prom[metric] - a.prom[metric]);
+    const mejor = orden[0], peor = orden[orden.length - 1];
+    const b = (t) => el('b', { textContent: t });
+    res.append('El día que más se vende es el ', b(mejor.nombre.toLowerCase()), ': en promedio ', b(money(mejor.prom.facturacion)), ' y ',
+      b(L.format(',.1f')(mejor.prom.ordenes)), ' ventas. El más flojo es el ', b(peor.nombre.toLowerCase()), ' (', b(money(peor.prom.facturacion)), ').');
+    if (S.mes) res.append(' Con un solo mes elegido cada día de la semana se promedia sobre 4 o 5 días, así que tomalo con cuidado.');
+
+    const W = Math.max(280, box.clientWidth - 24), H = Math.round(Math.max(220, Math.min(300, W * 0.32)));
+    const svg = d3.select(box).append('svg').attr('viewBox', `0 0 ${W} ${H}`).attr('role', 'img')
+      .attr('aria-label', `Promedio por día de la semana. Mejor día: ${mejor.nombre}`);
+    const corto = W < 520;
+    const x = d3.scaleBand().domain(DIAS_SEM).range([4, W - 4]).padding(0.25);
+    const y = d3.scaleLinear().domain([0, d3.max(g, (d) => d.prom[metric]) || 1]).range([H - 24, 22]);
+    const c0 = S.cuenta ? color(S.cuenta) : PALETA[0];
+    svg.append('line').attr('x1', 4).attr('x2', W - 4).attr('y1', y(0)).attr('y2', y(0)).style('stroke', 'var(--line)');
+    svg.append('g').selectAll('rect').data(g).join('rect').attr('x', (d) => x(d.nombre)).attr('width', x.bandwidth())
+      .attr('y', (d) => y(d.prom[metric])).attr('height', (d) => y(0) - y(d.prom[metric])).attr('rx', 3)
+      .style('fill', c0).attr('opacity', (d) => d === mejor ? 1 : 0.45);
+    svg.append('g').selectAll('text').data(g).join('text').attr('x', (d) => x(d.nombre) + x.bandwidth() / 2).attr('y', (d) => y(d.prom[metric]) - 6)
+      .attr('text-anchor', 'middle').style('fill', 'var(--fg)').style('font-weight', (d) => d === mejor ? 600 : 400)
+      .text((d) => isMoney ? short(d.prom[metric], true) : fmt(d.prom[metric]));
+    svg.append('g').selectAll('text').data(g).join('text').attr('x', (d) => x(d.nombre) + x.bandwidth() / 2).attr('y', H - 6)
+      .attr('text-anchor', 'middle').text((d) => corto ? d.nombre.slice(0, 3) : d.nombre);
+    svg.append('g').selectAll('rect').data(g).join('rect').attr('x', (d) => x(d.nombre)).attr('width', x.bandwidth()).attr('height', H - 20)
+      .attr('fill', 'transparent')
+      .on('pointermove', (ev, d) => {
+        const s = svg.node().getBoundingClientRect().width / W;
+        tooltip(box, d.nombre, [['Facturación promedio', money(d.prom.facturacion)], ['Ventas promedio', L.format(',.1f')(d.prom.ordenes)],
+          ['Unidades promedio', L.format(',.1f')(d.prom.unidades)], ['Ticket promedio', money(d.ticket)],
+          ['% de la facturación', pct(d.participacion)], ['Días en el período', int(d.dias)]],
+          (x(d.nombre) + x.bandwidth() / 2) * s + 12, y(d.prom[metric]) * s + 12);
+      })
+      .on('pointerleave', () => ocultarTip(box));
+  }
+
   const ETQ = { facturacion: 'Facturación', ordenes: 'Ventas', unidades: 'Unidades', visitas: 'Visitas' };
   function chartMensual() {
     const box = $('ch-mensual'); box.replaceChildren();
@@ -362,7 +436,7 @@
   // ---------- render ----------
   function render() {
     if (!D) return;
-    $('f-cuenta').value = S.cuenta; $('f-metrica').value = S.metrica; $('f-orden').value = S.orden;
+    $('f-cuenta').value = S.cuenta; $('f-metrica').value = S.metrica; $('f-orden').value = S.orden; $('f-semana').value = S.semana;
     const ms = meses();
     const fm = $('f-mes');
     fm.replaceChildren(new Option('Últimos 12 meses', ''), ...ms.map((r) => new Option(mesLargo(r.mes) + parcial(r.mes), r.mes)));
@@ -394,7 +468,7 @@
       tarjeta('Visitas', int(k.visitas), k.v.visitas), tarjeta('Conversión (ventas ÷ visitas)', pct(k.conversion), k.v.conversion));
 
     $('leyenda').replaceChildren(...(S.cuenta ? [S.cuenta] : CUENTAS).map((c) => { const s = el('i', { className: 'sw' }); s.style.background = color(c); return el('span', {}, s, c); }));
-    chartDiario(); chartMensual();
+    chartDiario(); chartSemana(); chartMensual();
 
     $('tb-meses').replaceChildren(...ms.map((r) => {
       const tr = el('tr', { className: 'click' + (r.mes === S.mes ? ' sel' : '') },
@@ -437,6 +511,7 @@
   $('f-mes').onchange = (e) => set({ mes: e.target.value });
   $('f-metrica').onchange = (e) => set({ metrica: e.target.value });
   $('f-orden').onchange = (e) => set({ orden: e.target.value });
+  $('f-semana').onchange = (e) => set({ semana: e.target.value });
   $('f-reset').onclick = () => set({ cuenta: '', mes: '' });
   $('ver-mas').onclick = () => { todos = !todos; render(); };
   let ancho = window.innerWidth;
