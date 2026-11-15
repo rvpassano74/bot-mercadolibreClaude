@@ -1055,9 +1055,9 @@ async function procesarFilaPromo(cuentaId, fila, modo) {
     : 'Sin promoción';
   const vence = fechaDDMMYYYY(vigente?.finish_date);
 
-  out.info = [nombrePromo, vigente ? vigente.price : '', await calcularRecibis(cuentaId, item, vigente ? vigente.price : lista), vence,
+  out.info = [lista, nombrePromo, vigente ? vigente.price : '', await calcularRecibis(cuentaId, item, vigente ? vigente.price : lista), vence,
     precio5, await calcularRecibis(cuentaId, item, precio5)];
-  const recibis5 = out.info[5];
+  const recibis5 = out.info[6];
 
   if (!promos.length) return { ...out, estado: 'MercadoLibre no ofrece promociones para esta publicación hoy' };
 
@@ -1106,7 +1106,7 @@ async function procesarFilaPromo(cuentaId, fila, modo) {
   }
   try {
     const fin = await crearDescuentoPropio(cuentaId, id, precioQuiero);
-    out.info = [NOMBRE_TIPO_PROMO.PRICE_DISCOUNT, precioQuiero, recibiria, fechaDDMMYYYY(fin), precio5, recibis5];
+    out.info = [lista, NOMBRE_TIPO_PROMO.PRICE_DISCOUNT, precioQuiero, recibiria, fechaDDMMYYYY(fin), precio5, recibis5];
     return { ...out, estado: `Activada el ${fechaDDMMYYYY(fechaHoyAR())} a ${pesos(precioQuiero)}, vence ${fechaDDMMYYYY(fin)}`,
       accion: `✅ ${titulo}: activada a ${pesos(precioQuiero)} (recibís ${pesos(recibiria)})` };
   } catch (err) {
@@ -1158,7 +1158,7 @@ async function revisarPromociones({ modo = PROMO_MODO, solo = null } = {}) {
           resumen.errores.push(`${pestaña} ${id}: ${r.estado}`);
         }
         procesadas++;
-        if (r.info) cambios.push({ range: `'${pestaña}'!D${nroFila}:I${nroFila}`, values: [r.info] });
+        if (r.info) cambios.push({ range: `'${pestaña}'!C${nroFila}:I${nroFila}`, values: [r.info] });
         if (r.escribirPrecioQuiero) cambios.push({ range: `'${pestaña}'!K${nroFila}`, values: [[r.precioQuiero]] });
         cambios.push({ range: `'${pestaña}'!L${nroFila}:M${nroFila}`, values: [[r.recibiria ?? '', r.estado]] });
         if (r.accion) resumen.acciones.push(`[${pestaña}] ${r.accion}`);
