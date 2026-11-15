@@ -30,11 +30,15 @@ const {
   PORT = 3000,
 } = process.env;
 
-// Protege /debug/* y /api/* con una clave secreta (variable BOT_API_KEY
-// en Render). La clave se manda en el header "x-api-key" o en la URL
-// como ?key=LA_CLAVE. Si BOT_API_KEY no está configurada, quedan
-// bloqueadas (mejor cerrado que abierto a cualquiera).
-app.use(['/debug', '/api'], (req, res, next) => {
+// Protege la página principal (/), /cuentas/*, /debug/* y /api/* con una
+// clave secreta (variable BOT_API_KEY en Render). La clave se manda en el
+// header "x-api-key" o en la URL como ?key=LA_CLAVE. Si BOT_API_KEY no
+// está configurada, quedan bloqueadas (mejor cerrado que abierto a
+// cualquiera). /oauth/callback y /telegram/webhook quedan abiertas porque
+// las llaman Mercado Libre y Telegram.
+app.use((req, res, next) => {
+  const protegida = req.path === '/' || /^\/(debug|api|cuentas)(\/|$)/i.test(req.path);
+  if (!protegida) return next();
   if (!BOT_API_KEY) {
     return res.status(503).json({ error: 'Falta configurar BOT_API_KEY en Render.' });
   }
@@ -274,7 +278,7 @@ app.get('/', (req, res) => {
           ([id, c]) => `
           <div style="border:1px solid #ccc; padding:10px; margin-bottom:10px;">
             <b>${c.nombre}</b> (ID ${id}) ${c.refresh_token ? '✅' : '❌'}<br>
-            <form method="POST" action="/cuentas/${id}/chat" style="margin-top:6px;">
+            <form method="POST" action="/cuentas/${id}/chat?key=${encodeURIComponent(req.query.key || '')}" style="margin-top:6px;">
               Chat de Telegram para esta cuenta:
               <input type="text" name="chat_id" value="${c.chat_id || ''}" placeholder="ej: -1001234567890 (vacío = chat general)">
               <button type="submit">Guardar</button>
@@ -305,7 +309,7 @@ app.post('/cuentas/:id/chat', async (req, res) => {
   const chatId = (req.body.chat_id || '').trim();
   cuenta.chat_id = chatId || null;
   await saveData(data);
-  res.redirect('/');
+  res.redirect(`/?key=${encodeURIComponent(req.query.key || '')}`);
 });
 
 // Mercado Libre te redirige acá después de que autorizás una cuenta.
