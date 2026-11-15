@@ -974,10 +974,18 @@ const NOMBRE_TIPO_PROMO = {
 let promosEnCurso = false;
 let promosUltimaCorrida = null; // resumen para /debug/promos-estado
 
-async function mlGet(cuentaId, path) {
-  const token = await getAccessToken(cuentaId);
-  const { data: respuesta } = await axios.get(`https://api.mercadolibre.com${path}`, { headers: { Authorization: `Bearer ${token}` } });
-  return respuesta;
+// Si ML responde 429 (demasiados pedidos) espera y reintenta.
+async function mlGet(cuentaId, path, intentos = 5) {
+  for (let intento = 1; ; intento++) {
+    const token = await getAccessToken(cuentaId);
+    try {
+      const { data: respuesta } = await axios.get(`https://api.mercadolibre.com${path}`, { headers: { Authorization: `Bearer ${token}` } });
+      return respuesta;
+    } catch (err) {
+      if (err.response?.status !== 429 || intento >= intentos) throw err;
+      await new Promise((r) => setTimeout(r, 5000 * intento));
+    }
+  }
 }
 
 const redondear2 = (x) => Math.round(x * 100) / 100;
