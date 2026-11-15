@@ -953,6 +953,262 @@ app.all('/api/ml', async (req, res) => {
 });
 
 // =====================================================================
+// PROMOCIONES DESDE LA PLANILLA "Promociones MercadoLibre"
+// Cada 2 horas el bot lee la planilla (una pestaña por cuenta) y:
+//  - actualiza promoción actual, precios y lo que recibís,
+//  - si completaste "Quiero recibir", calcula el precio que te deja eso,
+//  - si una publicación se quedó sin promoción, le activa un descuento
+//    propio por 30 días a tu precio (en modo "aviso" solo lo informa).
+// Variables en Render: PROMO_SHEET_ID (ID de la planilla) y PROMO_MODO
+// ("aviso" = no toca nada en ML, "auto" = activa los descuentos).
+// =====================================================================
+
+const { PROMO_SHEET_ID, PROMO_MODO = 'aviso' } = process.env;
+const PROMO_CADA_MS = 2 * 60 * 60 * 1000;
+// Columnas de la planilla (A..M)
+const PCOL = { id: 0, quieroRecibir: 9, precioQuiero: 10 };
+const NOMBRE_TIPO_PROMO = {
+  PRICE_DISCOUNT: 'Descuento propio', DEAL: 'Campaña', SMART: 'Oferta compartida',
+  SMART_LIGHTNING: 'Relámpago compartida', LIGHTNING: 'Oferta relámpago', DOD: 'Oferta del día', VOLUME: 'Por volumen',
+};
+let promosEnCurso = false;
+let promosUltimaCorrida = null; // resumen para /debug/promos-estado
+
+async function mlGet(cuentaId, path) {
+  const token = await getAccessToken(cuentaId);
+  const { data: respuesta } = await axios.get(`https://api.mercadolibre.com${path}`, { headers: { Authorization: `Bearer ${token}` } });
+  return respuesta;
+}
+
+const redondear2 = (x) => Math.round(x * 100) / 100;
+const pesos = (x) => `$${Number(x).toLocaleString('es-AR', { maximumFractionDigits: 2 })}`;
+const fechaDDMMYYYY = (iso) => (iso ? iso.slice(0, 10).split('-').reverse().join('/') : '');
+
+// Lo mismo que muestra ML en "Recibís": precio - cargo por vender - envío
+// gratis (si lo ofrecés). Verificado al centavo contra la pantalla de ML.
+async function calcularRecibis(cuentaId, item, precio) {
+  const envio = await mlGet(cuentaId, `/users/${cuentaId}/shipping_options/free?item_id=${item.id}&item_price=${precio}`);
+  const cobertura = envio.coverage?.all_country || {};
+  const cargos = await mlGet(cuentaId,
+    `/sites/MLA/listing_prices?price=${precio}&listing_type_id=${item.listing_type_id}&category_id=${item.category_id}` +
+    `&billable_weight=${cobertura.billable_weight}&logistic_type=${item.shipping?.logistic_type}&shipping_mode=${item.shipping?.mode}`);
+  const costoEnvio = item.shipping?.free_shipping ? cobertura.list_cost || 0 : 0;
+  return redondear2(precio - cargos.sale_fee_amount - costoEnvio);
+}
+
+// Precio de promoción que deja (al menos) "objetivo" de plata recibida.
+async function precioParaRecibir(cuentaId, item, objetivo) {
+  let precio = Math.ceil(objetivo / 0.8);
+  let recibe = await calcularRecibis(cuentaId, item, precio);
+  for (let i = 0; i < 10 && (recibe < objetivo || recibe - objetivo >= 1); i++) {
+    precio = Math.ceil(precio + (objetivo - recibe));
+    recibe = await calcularRecibis(cuentaId, item, precio);
+  }
+  // Los cargos van por escalones: si quedó apenas por debajo, subimos de a $1.
+  for (let i = 0; i < 20 && recibe < objetivo; i++) {
+    precio += 1;
+    recibe = await calcularRecibis(cuentaId, item, precio);
+  }
+  return { precio, recibe };
+}
+
+function rangoFechas30Dias() {
+  const hoy = fechaHoyAR(); // YYYY-MM-DD en hora argentina
+  const fin = new Date(`${hoy}T12:00:00Z`);
+  fin.setUTCDate(fin.getUTCDate() + 29);
+  return { inicio: `${hoy}T00:00:00`, fin: `${fin.toISOString().slice(0, 10)}T23:59:59` };
+}
+
+async function crearDescuentoPropio(cuentaId, itemId, precio) {
+  const token = await getAccessToken(cuentaId);
+  const { inicio, fin } = rangoFechas30Dias();
+  await axios.post(`https://api.mercadolibre.com/seller-promotions/items/${itemId}?app_version=v2`,
+    { promotion_type: 'PRICE_DISCOUNT', deal_price: precio, start_date: inicio, finish_date: fin },
+    { headers: { Authorization: `Bearer ${token}` } });
+  return fin;
+}
+
+// Procesa una fila de la planilla. Devuelve las celdas a escribir y, si
+// corresponde, la acción (para el resumen de Telegram).
+async function procesarFilaPromo(cuentaId, fila, modo) {
+  const id = String(fila[PCOL.id] || '').trim();
+  const quiero = Number(fila[PCOL.quieroRecibir]) || 0;
+  let precioQuiero = Number(fila[PCOL.precioQuiero]) || 0;
+  const out = { escribirPrecioQuiero: false };
+
+  const item = await mlGet(cuentaId, `/items/${id}?attributes=id,title,price,status,category_id,listing_type_id,shipping,seller_id`);
+  if (String(item.seller_id) !== String(cuentaId)) return { ...out, estado: 'Esta publicación no es de esta cuenta' };
+  if (item.status !== 'active') return { ...out, estado: `Publicación no activa (${item.status})` };
+
+  let promos;
+  try {
+    promos = await mlGet(cuentaId, `/seller-promotions/items/${id}?app_version=v2`);
+  } catch (err) {
+    return { ...out, estado: `No se puede promocionar: ${err.response?.data?.message || err.message}` };
+  }
+  const vigente = promos.filter((p) => p.status === 'started' && p.price > 0).sort((a, b) => a.price - b.price)[0];
+  const candidato = promos.find((p) => p.type === 'PRICE_DISCOUNT' && p.status === 'candidate');
+  const lista = vigente?.original_price || item.price;
+  const precio5 = candidato?.max_discounted_price || redondear2(lista * 0.95);
+  const nombrePromo = vigente
+    ? vigente.type === 'PRICE_DISCOUNT' ? NOMBRE_TIPO_PROMO.PRICE_DISCOUNT : `${NOMBRE_TIPO_PROMO[vigente.type] || vigente.type}${vigente.name ? ': ' + vigente.name : ''}`
+    : 'Sin promoción';
+  const vence = fechaDDMMYYYY(vigente?.finish_date);
+
+  out.info = [nombrePromo, vigente ? vigente.price : '', await calcularRecibis(cuentaId, item, vigente ? vigente.price : lista), vence,
+    precio5, await calcularRecibis(cuentaId, item, precio5)];
+  const recibis5 = out.info[5];
+
+  if (!promos.length) return { ...out, estado: 'MercadoLibre no ofrece promociones para esta publicación hoy' };
+
+  // Precio objetivo: "Quiero recibir" tiene prioridad sobre "Precio que quiero".
+  let recibiria = '';
+  if (quiero > 0) {
+    if (recibis5 < quiero) {
+      return { ...out, recibiria: '', estado: `No da: con el descuento mínimo (5%) recibís ${pesos(recibis5)}, menos de ${pesos(quiero)}. Habría que subir el precio de lista.` };
+    }
+    const r = await precioParaRecibir(cuentaId, { ...item }, quiero);
+    if (r.precio !== precioQuiero) out.escribirPrecioQuiero = true;
+    precioQuiero = r.precio;
+    recibiria = r.recibe;
+  } else if (precioQuiero > 0) {
+    recibiria = await calcularRecibis(cuentaId, item, precioQuiero);
+  }
+  out.precioQuiero = precioQuiero || '';
+  out.recibiria = recibiria;
+
+  if (precioQuiero > 0 && precioQuiero > precio5) {
+    return { ...out, estado: `El precio tiene que ser como máximo ${pesos(precio5)} (5% menos que la lista)` };
+  }
+  if (precioQuiero > 0 && candidato?.min_discounted_price && precioQuiero < candidato.min_discounted_price) {
+    return { ...out, estado: `MercadoLibre no deja bajar de ${pesos(candidato.min_discounted_price)}` };
+  }
+
+  if (vigente && vigente.type !== 'PRICE_DISCOUNT') {
+    return { ...out, estado: `En ${nombrePromo}${vence ? ' hasta ' + vence : ''}. No se toca; ${precioQuiero ? 'tu precio se aplica cuando termine' : 'cargá un precio para cuando termine'}.` };
+  }
+  if (vigente) {
+    if (!precioQuiero) return { ...out, estado: `Descuento vigente hasta ${vence}. Sin precio cargado: al vencer no se renueva.` };
+    return {
+      ...out,
+      estado: Math.abs(vigente.price - precioQuiero) < 1
+        ? `OK: descuento vigente hasta ${vence}; al vencer se renueva solo.`
+        : `Descuento vigente a ${pesos(vigente.price)} hasta ${vence}; al vencer se renueva a ${pesos(precioQuiero)}.`,
+    };
+  }
+  if (!candidato) return { ...out, estado: 'MercadoLibre hoy no permite descuento propio en esta publicación' };
+  if (!precioQuiero) return { ...out, estado: 'Sin promoción y sin precio cargado' };
+
+  const titulo = item.title;
+  if (modo !== 'auto') {
+    return { ...out, estado: `AVISO: activaría descuento a ${pesos(precioQuiero)} por 30 días (recibís ${pesos(recibiria)})`,
+      accion: `🔸 ${titulo}: activaría ${pesos(precioQuiero)} (recibís ${pesos(recibiria)})` };
+  }
+  try {
+    const fin = await crearDescuentoPropio(cuentaId, id, precioQuiero);
+    out.info = [NOMBRE_TIPO_PROMO.PRICE_DISCOUNT, precioQuiero, recibiria, fechaDDMMYYYY(fin), precio5, recibis5];
+    return { ...out, estado: `Activada el ${fechaDDMMYYYY(fechaHoyAR())} a ${pesos(precioQuiero)}, vence ${fechaDDMMYYYY(fin)}`,
+      accion: `✅ ${titulo}: activada a ${pesos(precioQuiero)} (recibís ${pesos(recibiria)})` };
+  } catch (err) {
+    const motivo = err.response?.data?.message || err.message;
+    return { ...out, estado: `Error al activar: ${motivo}`, accion: `❌ ${titulo}: no se pudo activar (${motivo})` };
+  }
+}
+
+// Recorre la planilla. "solo" = procesar una única publicación (pruebas).
+async function revisarPromociones({ modo = PROMO_MODO, solo = null } = {}) {
+  if (!PROMO_SHEET_ID) return { error: 'Falta la variable PROMO_SHEET_ID en Render.' };
+  if (promosEnCurso) return { error: 'Ya hay una corrida de promociones en curso.' };
+  promosEnCurso = true;
+  const resumen = { inicio: new Date().toISOString(), modo, solo, pestañas: {}, acciones: [], errores: [] };
+  try {
+    const sheets = await clienteSheets();
+    const { data: meta } = await sheets.spreadsheets.get({ spreadsheetId: PROMO_SHEET_ID, fields: 'sheets.properties.title' });
+    for (const { properties: { title: pestaña } } of meta.sheets) {
+      const { data: valores } = await sheets.spreadsheets.values.get({
+        spreadsheetId: PROMO_SHEET_ID, range: `'${pestaña}'!A2:M`, valueRenderOption: 'UNFORMATTED_VALUE',
+      });
+      const filas = valores.values || [];
+      // A qué cuenta corresponde la pestaña: la dueña de su primera publicación.
+      const primerId = filas.map((f) => String(f[PCOL.id] || '').trim()).find((x) => /^MLA\d+$/.test(x));
+      const cualquierCuenta = Object.keys(data.cuentas || {})[0];
+      if (!primerId || !cualquierCuenta) continue;
+      const cuentaId = String((await mlGet(cualquierCuenta, `/items/${primerId}?attributes=seller_id`)).seller_id);
+      if (!data.cuentas[cuentaId]) {
+        resumen.errores.push(`${pestaña}: la cuenta ${cuentaId} no está conectada al bot`);
+        continue;
+      }
+      const cambios = [];
+      let procesadas = 0;
+      for (let i = 0; i < filas.length; i++) {
+        const fila = filas[i];
+        const id = String(fila[PCOL.id] || '').trim();
+        if (!/^MLA\d+$/.test(id) || (solo && id !== solo)) continue;
+        const nroFila = i + 2;
+        let r;
+        try {
+          r = await procesarFilaPromo(cuentaId, fila, modo);
+        } catch (err) {
+          r = { estado: `Error: ${err.response?.data?.message || err.message}` };
+          resumen.errores.push(`${pestaña} ${id}: ${r.estado}`);
+        }
+        procesadas++;
+        if (r.info) cambios.push({ range: `'${pestaña}'!D${nroFila}:I${nroFila}`, values: [r.info] });
+        if (r.escribirPrecioQuiero) cambios.push({ range: `'${pestaña}'!K${nroFila}`, values: [[r.precioQuiero]] });
+        cambios.push({ range: `'${pestaña}'!L${nroFila}:M${nroFila}`, values: [[r.recibiria ?? '', r.estado]] });
+        if (r.accion) resumen.acciones.push(`[${pestaña}] ${r.accion}`);
+      }
+      if (cambios.length) {
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId: PROMO_SHEET_ID, requestBody: { valueInputOption: 'USER_ENTERED', data: cambios },
+        });
+      }
+      resumen.pestañas[pestaña] = { cuenta: cuentaId, procesadas };
+    }
+
+    // Aviso por Telegram: en modo "auto" cada vez que hizo algo; en modo
+    // "aviso" una sola vez por día (para no repetir lo mismo cada 2 horas).
+    const hoy = fechaHoyAR();
+    const avisar = resumen.acciones.length || resumen.errores.length;
+    if (avisar && TELEGRAM_CHAT_ID && (modo === 'auto' || solo || data.promos_aviso_fecha !== hoy)) {
+      let texto = modo === 'auto'
+        ? '🏷️ Promociones: esto hice ahora'
+        : '🏷️ Promociones (MODO AVISO, no toqué nada en MercadoLibre). Esto haría:';
+      texto += `\n\n${resumen.acciones.join('\n')}`;
+      if (resumen.errores.length) texto += `\n\n⚠️ Errores:\n${resumen.errores.join('\n')}`;
+      if (texto.length > 3900) texto = texto.slice(0, 3900) + '\n… (sigue en la planilla, columna Estado)';
+      await axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: texto });
+      if (modo !== 'auto' && !solo) {
+        data.promos_aviso_fecha = hoy;
+        await saveData(data);
+      }
+    }
+  } catch (err) {
+    resumen.errores.push(`General: ${err.response?.data?.error?.message || err.response?.data?.message || err.message}`);
+    console.error('Error en revisarPromociones:', err.response?.data || err.message);
+  } finally {
+    promosEnCurso = false;
+    resumen.fin = new Date().toISOString();
+    promosUltimaCorrida = resumen;
+  }
+  return resumen;
+}
+
+// Corre la revisión de promociones a mano. ?modo=aviso|auto (por defecto
+// el de PROMO_MODO) y ?solo=MLA123 para procesar una sola publicación.
+app.get('/debug/promos-run', async (req, res) => {
+  const modo = req.query.modo === 'auto' || req.query.modo === 'aviso' ? req.query.modo : PROMO_MODO;
+  const solo = req.query.solo || null;
+  if (solo) return res.json(await revisarPromociones({ modo, solo })); // una sola: esperamos el resultado
+  revisarPromociones({ modo });
+  res.json({ ok: true, mensaje: 'Arrancó en segundo plano. El resultado queda en /debug/promos-estado y en la planilla.' });
+});
+
+app.get('/debug/promos-estado', (req, res) => {
+  res.json({ modo_configurado: PROMO_MODO, en_curso: promosEnCurso, ultima_corrida: promosUltimaCorrida });
+});
+
+// =====================================================================
 // HERRAMIENTAS DE DIAGNÓSTICO
 // =====================================================================
 
@@ -3524,6 +3780,10 @@ async function start() {
   app.listen(PORT, () => console.log(`Servidor corriendo en el puerto ${PORT}`));
   setInterval(revisarTodo, 60 * 1000); // cada 1 minuto
   revisarTodo(); // y una vez apenas arranca
+  if (PROMO_SHEET_ID) {
+    setInterval(() => revisarPromociones(), PROMO_CADA_MS); // promociones desde la planilla, cada 2 horas
+    setTimeout(() => revisarPromociones(), 5 * 60 * 1000); // y 5 minutos después de arrancar
+  }
 }
 
 start();
