@@ -6,6 +6,7 @@ const { PDFDocument } = require('pdf-lib');
 const FormData = require('form-data');
 const ExcelJS = require('exceljs');
 const { registrarDashboard } = require('./dashboard');
+const { registrarIIBB } = require('./iibb');
 
 const app = express();
 app.use(express.json());
@@ -893,6 +894,24 @@ app.post('/telegram/webhook', async (req, res) => {
         chat_id: message.chat.id,
         text: `❌ No pude leer "${nombreArchivo}" como reporte de ventas de Mercado Libre (${err.message}). ¿Es el Excel de "Descargar Excel de ventas"?`,
       });
+    }
+    return;
+  }
+
+  // /iibb o /iibb 2026-10: reporte de Ingresos Brutos del mes (ver iibb.js).
+  // Solo responde en los chats que el bot ya usa, porque son datos de facturación.
+  if (message.text && /^\/iibb(@\w+)?(\s|$)/i.test(message.text.trim())) {
+    const permitidos = [TELEGRAM_CHAT_ID, TELEGRAM_CHAT_ID_RESUMEN, ...Object.values(data.cuentas || {}).map((c) => c.chat_id)]
+      .filter(Boolean).map(String);
+    if (!permitidos.includes(String(message.chat.id))) return;
+    const enviar = (text) => axios.post(`${TELEGRAM_API}/sendMessage`, { chat_id: message.chat.id, text });
+    try {
+      await enviar('🧾 Calculando Ingresos Brutos de las cuentas… tarda un minuto.');
+      const texto = await iibb.responderComando(message.text);
+      for (let i = 0; i < texto.length; i += 4000) await enviar(texto.slice(i, i + 4000));
+    } catch (err) {
+      console.error('Error en /iibb:', err.response?.data || err.message);
+      await enviar(`❌ No pude armar el reporte de Ingresos Brutos (${err.message}).`);
     }
     return;
   }
@@ -4015,6 +4034,8 @@ app.get('/debug/orden-detalle', async (req, res) => {
 
 // Dashboard de ventas de las cuentas conectadas (ver dashboard.js).
 const dashboard = registrarDashboard(app, { mlGet, getCuentas: () => data.cuentas || {}, zonaHoraria: ZONA_HORARIA });
+// Reporte de Ingresos Brutos: comando /iibb y GET /api/iibb?month=AAAA-MM (ver iibb.js).
+const iibb = registrarIIBB(app, { mlGet, getCuentas: () => data.cuentas || {}, zonaHoraria: ZONA_HORARIA });
 
 async function start() {
   data = await loadData();
