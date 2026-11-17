@@ -84,7 +84,8 @@ function registrarIIBB(app, { mlGet, getCuentas, zonaHoraria }) {
       if (delMes.length) usados.push(p);
       for (const x of delMes) {
         lineas.push({
-          descripcion: x.regimen_tax_type_description || x.tax_type_description || x.tax_type,
+          // A veces la descripción del régimen es solo un código (ej. MLA_RE_IVA): usamos la del impuesto.
+          descripcion: (/\s/.test(x.regimen_tax_type_description || '') ? x.regimen_tax_type_description : x.tax_type_description) || x.tax_type,
           codigo: x.tax_type,
           jurisdiccion: clasificarPercepcion(`${x.regimen_tax_type_description || ''} ${x.tax_type_description || ''}`),
           base: x.taxable_amount, alicuota: x.aliquot, monto: x.amount,
@@ -146,11 +147,30 @@ function registrarIIBB(app, { mlGet, getCuentas, zonaHoraria }) {
 
   const mesValido = (s) => /^\d{4}-(0[1-9]|1[0-2])$/.test(s || '');
 
-  // GET /api/iibb?month=2026-10 (protegido con la misma clave que /api/*)
+  // El dashboard pide el mismo mes muchas veces: guardamos cada reporte 1 hora
+  // (y compartimos el cálculo si llegan dos pedidos a la vez). Si salió con
+  // errores no se guarda.
+  const cache = new Map();
+  const UNA_HORA = 60 * 60 * 1000;
+  function reporteConCache(mes, { nuevo = false } = {}) {
+    const c = cache.get(mes);
+    if (c && !nuevo && (c.calculando || Date.now() - c.at < UNA_HORA)) return c.promesa;
+    const promesa = armarReporte(mes);
+    const entrada = { at: Date.now(), promesa, calculando: true };
+    cache.set(mes, entrada);
+    promesa.then((rep) => {
+      entrada.calculando = false;
+      entrada.at = Date.now();
+      if (rep.cuentas.some((x) => x.errorVentas || x.errorPercepciones) && cache.get(mes) === entrada) cache.delete(mes);
+    }, () => { if (cache.get(mes) === entrada) cache.delete(mes); });
+    return promesa;
+  }
+
+  // GET /api/iibb?month=2026-10 (protegido con la misma clave que /api/*). &nuevo=1 recalcula.
   app.get('/api/iibb', async (req, res) => {
     const mes = req.query.month || mesAnteriorAR(zonaHoraria);
     if (!mesValido(mes)) return res.status(400).json({ error: 'month tiene que ser AAAA-MM, por ejemplo 2026-10.' });
-    try { res.json(await armarReporte(mes)); } catch (err) { res.status(500).json({ error: err.message }); }
+    try { res.json(await reporteConCache(mes, { nuevo: req.query.nuevo === '1' })); } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
   // Devuelve el texto para Telegram a partir de lo que escribió el usuario ("/iibb" o "/iibb 2026-10").
@@ -158,7 +178,7 @@ function registrarIIBB(app, { mlGet, getCuentas, zonaHoraria }) {
     const arg = textoMensaje.trim().split(/\s+/)[1];
     const mes = arg || mesAnteriorAR(zonaHoraria);
     if (!mesValido(mes)) return 'Usá /iibb para el mes anterior, o /iibb AAAA-MM (por ejemplo /iibb 2026-10).';
-    return texto(await armarReporte(mes));
+    return texto(await reporteConCache(mes, { nuevo: true }));
   }
 
   return { armarReporte, responderComando };

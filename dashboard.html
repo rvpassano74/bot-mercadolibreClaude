@@ -141,6 +141,23 @@
 
       <section>
         <div class="head">
+          <h2>Ingresos Brutos</h2>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <label for="f-iibb" class="note" style="display:flex;gap:8px;align-items:center">Mes <select id="f-iibb"></select></label>
+            <button type="button" id="iibb-recalcular">Volver a calcular</button>
+          </div>
+        </div>
+        <p class="note" id="iibb-estado"></p>
+        <div class="wrap"><table>
+          <thead><tr><th>Cuenta</th><th>Órdenes</th><th>Bruto</th><th>Devoluciones y cancelaciones</th><th>Neto</th><th>IIBB CABA</th><th>IIBB Bs. As.</th><th>IVA</th><th>Otras</th><th>Factura de ML (período)</th></tr></thead>
+          <tbody id="tb-iibb"></tbody>
+        </table></div>
+        <div class="note" id="iibb-detalle" style="display:flex;flex-direction:column;gap:4px"></div>
+        <p class="note">Ventas por fecha de cierre de la orden. Bruto: total de cada orden. Devoluciones: lo reembolsado, o el total si la orden se canceló. Percepciones: las de las facturas que Mercado Libre emitió en el mes (ML factura por período, no por mes calendario). Muestra las 3 cuentas aunque arriba haya una elegida.</p>
+      </section>
+
+      <section>
+        <div class="head">
           <h2>Qué se vende más</h2>
           <label for="f-orden">Ordenar por
             <select id="f-orden">
@@ -506,6 +523,61 @@
     $('ver-mas').textContent = todos ? 'Ver solo los primeros 25' : `Ver todos los productos (${ps.length})`;
   }
 
+  // ---------- Ingresos Brutos (lo calcula el bot en /api/iibb, igual que /iibb en Telegram) ----------
+  const IIBB = { mes: '', rep: {}, cargando: new Set(), error: {} };
+  function mesesIIBB() {
+    const out = [];
+    let [y, m] = D.hasta.slice(0, 7).split('-').map(Number);
+    for (let i = 0; i < 13; i++) { out.push(`${y}-${String(m).padStart(2, '0')}`); m--; if (!m) { m = 12; y--; } }
+    return out;
+  }
+  async function cargarIIBB(mes, nuevo) {
+    IIBB.cargando.add(mes); delete IIBB.error[mes]; renderIIBB();
+    try {
+      const r = await fetch(q(`/api/iibb?month=${mes}${nuevo ? '&nuevo=1' : ''}`));
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `error ${r.status}`);
+      IIBB.rep[mes] = j;
+    } catch (e) { IIBB.error[mes] = e.message; }
+    IIBB.cargando.delete(mes); renderIIBB();
+  }
+  function renderIIBB() {
+    const mes = IIBB.mes, rep = IIBB.rep[mes], cargando = IIBB.cargando.has(mes), err = IIBB.error[mes];
+    $('iibb-recalcular').disabled = cargando;
+    $('iibb-estado').textContent = cargando ? 'Calculando con Mercado Libre… tarda alrededor de un minuto.'
+      : err ? `No se pudo calcular: ${err}. Probá "Volver a calcular".`
+      : rep ? `Calculado ${hace(rep.generado)}.` + (mes === D.hasta.slice(0, 7) ? ' El mes está en curso, los números van a seguir cambiando.' : '') : '';
+    const tb = $('tb-iibb'), det = $('iibb-detalle');
+    det.replaceChildren();
+    if (!rep) { vacio(tb, 10, cargando ? 'Calculando…' : 'Sin datos'); return; }
+    const per = (c) => c.percepciones ? (c.percepciones.periodos.length ? c.percepciones.periodos.map((p) => `${ddmm(p.desde)} al ${ddmm(p.hasta)}`).join(', ') : 'ninguna en el mes') : '—';
+    const fila = (nombre, v, t, periodo, negrita) => {
+      const tr = el('tr', {}, td(nombre), td(v ? int(v.ordenes) : '—'), td(v ? money2(v.bruto) : '—'), td(v ? money2(v.devoluciones) : '—'), td(v ? money2(v.neto) : '—'),
+        td(t ? money2(t.CABA) : '—'), td(t ? money2(t['Buenos Aires']) : '—'), td(t ? money2(t.IVA) : '—'), td(t ? money2(t.Otras) : '—'), td(periodo, 'left'));
+      if (negrita) tr.style.fontWeight = '600';
+      return tr;
+    };
+    tb.replaceChildren(...rep.cuentas.map((c) => fila(c.cuenta, c.ventas, c.percepciones && c.percepciones.totales, per(c))),
+      fila('Total', rep.totales, rep.totales, '', true));
+    for (const c of rep.cuentas) {
+      if (c.errorVentas) det.append(el('span', { className: 'down', textContent: `${c.cuenta}: no se pudieron leer las ventas (${c.errorVentas}).` }));
+      if (c.errorPercepciones) det.append(el('span', { className: 'down', textContent: `${c.cuenta}: no se pudieron leer las percepciones (${c.errorPercepciones}).` }));
+      for (const l of (c.percepciones ? c.percepciones.lineas : []).filter((x) => x.jurisdiccion === 'Otras' || x.jurisdiccion === 'IVA')) {
+        det.append(el('span', { textContent: `${c.cuenta} · ${l.jurisdiccion}: ${l.descripcion} — ${money2(l.monto)}` }));
+      }
+    }
+  }
+  const money2 = (v) => ok(v) ? L.format('$,.2f')(v) : '—';
+  function iniciarIIBB() {
+    const meses = mesesIIBB();
+    $('f-iibb').replaceChildren(...meses.map((m, i) => new Option(mesLargo(m) + (i === 0 ? ' (en curso)' : ''), m)));
+    IIBB.mes = meses[1];
+    $('f-iibb').value = IIBB.mes;
+    cargarIIBB(IIBB.mes, false);
+  }
+  $('f-iibb').onchange = (e) => { IIBB.mes = e.target.value; if (IIBB.rep[IIBB.mes] || IIBB.cargando.has(IIBB.mes)) renderIIBB(); else cargarIIBB(IIBB.mes, false); };
+  $('iibb-recalcular').onclick = () => cargarIIBB(IIBB.mes, true);
+
   // ---------- controles ----------
   $('f-cuenta').onchange = (e) => set({ cuenta: e.target.value });
   $('f-mes').onchange = (e) => set({ mes: e.target.value });
@@ -539,6 +611,7 @@
       $('actualizado').textContent = `Datos de Mercado Libre, actualizados ${hace(D.generado)}` + (D.actualizando ? ' · actualizando…' : '') + (D.error ? ` · la última actualización falló (${D.error})` : '');
       $('btn-actualizar').disabled = !!D.actualizando;
       render();
+      if (!IIBB.mes) iniciarIIBB(); else renderIIBB();
       if (D.actualizando) espera = setTimeout(cargar, 20000);
     } catch (e) {
       $('lead').textContent = 'No se pudo conectar con el bot. Reintentando…';
